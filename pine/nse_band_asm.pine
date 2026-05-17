@@ -3,23 +3,32 @@
 // NSE Price Band & ASM Info
 // Reads band % and ASM surveillance status from the Java ETL output.
 //
-// ETL produces: data/nse_metadata.csv  (single consolidated file)
-// Audit file  : data/nse_asm_full.csv  (full daily ASM snapshot)
+// ETL produces:
+//   data/nse_metadata.csv  — full canonical seed (unchanged)
+//   data/nse_udf_ohlc.csv  — OHLC-packed UDF feed (new)
 //
-// DISPLAY:
-//   • Info table  : bottom-right — Symbol | Band | ASM status + stage
-//   • Band label  : above last bar (orange or red when in ASM)
-//   • ASM label   : below last bar (red, only when in ASM)
-//   • Bg tint     : subtle red background on all bars when symbol in ASM
-//   • Screener    : Band PCT + ASM Code plots (display=none, Pine Screener ready)
+// OHLC FIELD MAPPING (when UDF mode is enabled):
+//   open   → BAND_PCT      (e.g. 5 / 10 / 20 / 0 = no band)
+//   high   → LOWER_BAND    (absolute ₹ lower circuit price)
+//   low    → UPPER_BAND    (absolute ₹ upper circuit price)
+//   close  → ASM_CODE      (0=none  11=STASM-I … 30=GSM)
+//   volume → LAST_PRICE    (last traded price from ETL)
 //
-// SETUP:
-//   1. Run Java ETL daily at 09:15 IST → generates data/nse_metadata.csv
-//   2. Host nse_metadata.csv at a public HTTPS URL
-//   3. Send a TradingView webhook alert with:
-//        BAND_LABEL=20% | BAND_PCT=20 | ASM_LABEL=STASM-I | ASM_CODE=11
-//      → Pine input overrides are updated from the alert message
-//   4. Alternatively: update the override inputs manually each morning
+// SETUP (UDF mode — recommended):
+//   1. Run Java ETL daily at 09:15 IST
+//        → writes data/nse_metadata.csv  (seed, for audit)
+//        → writes data/nse_udf_ohlc.csv  (OHLC-packed feed)
+//        → POSTs nse_udf_ohlc.csv to UDF_SERVER_URL/udf/bars/bulk
+//   2. Set UDF_SERVER_URL env var on your server, e.g. http://localhost:8080
+//   3. In TradingView: add your UDF server as a custom data source
+//   4. In this indicator: enter the UDF symbol in "UDF Symbol" input,
+//        e.g. NSE_META:RELIANCE   (prefix:SYMBOL exactly as your server serves)
+//   5. All OHLC fields are decoded automatically — no manual inputs needed.
+//
+// SETUP (manual/webhook fallback):
+//   Leave "UDF Symbol" blank.  Update the Data Override inputs manually
+//   each morning, or send them via TradingView webhook alert:
+//     BAND_LABEL=20% | BAND_PCT=20 | ASM_LABEL=STASM-I | ASM_CODE=11
 //
 // ASM_CODE reference (matches AsmStageCode.java exactly):
 //   0  = not in ASM
@@ -32,30 +41,90 @@ indicator("NSE Band & ASM Info", shorttitle = "NSE-BAND-ASM",
           overlay = true, max_labels_count = 10, max_tables_count = 1)
 
 // ── Input groups ─────────────────────────────────────────────────────────────
-string G_DATA    = "Data (populated by ETL webhook or manual daily update)"
+string G_UDF     = "UDF Feed (auto-decode from OHLC)"
+string G_DATA    = "Data Override (manual / webhook — used when UDF Symbol is blank)"
 string G_DISPLAY = "Display"
 string G_COLOURS = "Colours"
 
-// ── Data override inputs ──────────────────────────────────────────────────────
+// ── UDF symbol input ──────────────────────────────────────────────────────────
+// Enter the UDF symbol exactly as your server serves it, e.g. NSE_META:RELIANCE
+// Leave blank to use the manual override inputs below.
+string i_udf_symbol = input.string("",
+                        title   = "UDF Symbol",
+                        tooltip = "e.g. NSE_META:RELIANCE  —  prefix:SYMBOL as served by your UDF server.\n" +
+                                  "Leave blank to use the manual Data Override inputs.",
+                        group   = G_UDF)
+
+// ── UDF decode (request.security on synthetic ticker) ─────────────────────────
+// All five fields are extracted in one request.security call via a tuple.
+// When i_udf_symbol is blank, these will be na and the manual inputs are used.
+bool   udf_mode = i_udf_symbol != ""
+
+// Decode the 5 packed OHLC fields from the UDF feed symbol.
+// open   → BAND_PCT
+// high   → LOWER_BAND
+// low    → UPPER_BAND
+// close  → ASM_CODE  (integer stored as float; cast to int below)
+// volume → LAST_PRICE
+[udf_band_pct, udf_lower_band, udf_upper_band, udf_asm_code_f, udf_last_price] =
+    request.security(
+        udf_mode ? i_udf_symbol : syminfo.tickerid,
+        timeframe.period,
+        [open, high, low, close, volume],
+        lookahead = barmerge.lookahead_off)
+
+// ── Data override inputs (manual / webhook fallback) ─────────────────────────
 string i_band_label = input.string("",   "Band Label",
-                        tooltip = "e.g. 20%  — exact NSE string",
+                        tooltip = "e.g. 20%  — exact NSE string.  Auto-derived from Band % when blank.",
                         group   = G_DATA)
 float  i_band_pct   = input.float(0.0,  "Band % (numeric)",
                         minval  = 0, step = 1,
-                        tooltip = "e.g. 20 for a 20% circuit",
+                        tooltip = "e.g. 20 for a 20% circuit.  Ignored when UDF Symbol is set.",
                         group   = G_DATA)
 string i_asm_label  = input.string("",   "ASM Label",
-                        tooltip = "e.g. STASM-I  /  LTASM-II  /  LTASM-IV  /  GSM",
+                        tooltip = "e.g. STASM-I  /  LTASM-II  /  LTASM-IV  /  GSM.  Ignored when UDF Symbol is set.",
                         group   = G_DATA)
 string i_asm_type   = input.string("",   "ASM Type",
-                        tooltip = "STASM / LTASM / GSM — raw type field",
+                        tooltip = "STASM / LTASM / GSM — raw type field.  Ignored when UDF Symbol is set.",
                         group   = G_DATA)
 string i_asm_stage  = input.string("",   "ASM Stage",
-                        tooltip = "I / II / III / IV",
+                        tooltip = "I / II / III / IV.  Ignored when UDF Symbol is set.",
                         group   = G_DATA)
 int    i_asm_code   = input.int(0,       "ASM Code",
-                        tooltip = "0=none  11=STASM-I  12=STASM-II  13=STASM-III  21=LTASM-I  22=LTASM-II  23=LTASM-III  24=LTASM-IV  30=GSM",
+                        tooltip = "0=none  11=STASM-I  12=STASM-II  13=STASM-III  21=LTASM-I  22=LTASM-II  23=LTASM-III  24=LTASM-IV  30=GSM.  Ignored when UDF Symbol is set.",
                         group   = G_DATA)
+
+// ── Resolved values — UDF takes precedence over manual inputs ─────────────────
+float  r_band_pct   = udf_mode and not na(udf_band_pct)  ? udf_band_pct               : i_band_pct
+float  r_lower_band = udf_mode and not na(udf_lower_band) ? udf_lower_band             : 0.0
+float  r_upper_band = udf_mode and not na(udf_upper_band) ? udf_upper_band             : 0.0
+int    r_asm_code   = udf_mode and not na(udf_asm_code_f) ? int(udf_asm_code_f)        : i_asm_code
+float  r_last_price = udf_mode and not na(udf_last_price) ? udf_last_price             : 0.0
+
+// Derive band label: prefer manual override, else build from band_pct
+string r_band_label = (not udf_mode and i_band_label != "") ? i_band_label
+                    : r_band_pct > 0                        ? str.tostring(r_band_pct, "#.##") + "%"
+                    : "No Band"
+
+// Derive ASM label from code when in UDF mode (code is the source of truth)
+string r_asm_label =
+    udf_mode ?
+        r_asm_code == 0  ? ""
+      : r_asm_code == 11 ? "STASM-I"
+      : r_asm_code == 12 ? "STASM-II"
+      : r_asm_code == 13 ? "STASM-III"
+      : r_asm_code == 21 ? "LTASM-I"
+      : r_asm_code == 22 ? "LTASM-II"
+      : r_asm_code == 23 ? "LTASM-III"
+      : r_asm_code == 24 ? "LTASM-IV"
+      : r_asm_code == 30 ? "GSM"
+      : "ASM"
+    : i_asm_label
+
+string r_asm_type  = udf_mode ? ""
+                   : i_asm_type
+string r_asm_stage = udf_mode ? ""
+                   : i_asm_stage
 
 // ── Display toggles ───────────────────────────────────────────────────────────
 bool  i_show_band  = input.bool(true,  "Show Band label",    group = G_DISPLAY)
@@ -68,33 +137,30 @@ color i_band_col = input.color(color.new(color.orange, 0), "Band colour",   grou
 color i_asm_col  = input.color(color.new(color.red,    0), "ASM colour",    group = G_COLOURS)
 color i_ok_col   = input.color(color.new(color.teal,   0), "Normal colour", group = G_COLOURS)
 
-// ── Derived ───────────────────────────────────────────────────────────────────
+// ── Derived booleans ─────────────────────────────────────────────────────────
 string sym      = syminfo.ticker
-bool   in_asm   = i_asm_code > 0 or i_asm_label != ""
-bool   in_stasm = i_asm_code >= 11 and i_asm_code <= 13
-bool   in_ltasm = i_asm_code >= 21 and i_asm_code <= 29  // covers Stage I–IV (codes 21–24) and future stages up to 29
-bool   in_gsm   = i_asm_code == 30
+bool   in_asm   = r_asm_code > 0 or r_asm_label != ""
+bool   in_stasm = r_asm_code >= 11 and r_asm_code <= 13
+bool   in_ltasm = r_asm_code >= 21 and r_asm_code <= 29
+bool   in_gsm   = r_asm_code == 30
 
 // Display strings
-string band_disp = i_band_label != "" ? i_band_label
-                 : i_band_pct   >  0  ? str.tostring(i_band_pct, "#.##") + "%"
-                 : "No Band"
-string asm_disp  = i_asm_label  != "" ? "\u26A0 " + i_asm_label   // ⚠ + label
-                 : in_asm            ? "\u26A0 ASM"
-                 : ""
-string asm_detail = i_asm_type != "" ? i_asm_type + " Stage " + i_asm_stage : ""
+string band_disp  = r_band_label
+string asm_disp   = r_asm_label != "" ? "\u26A0 " + r_asm_label : ""
+string asm_detail = r_asm_type  != "" ? r_asm_type + " Stage " + r_asm_stage : ""
+
+// UDF source indicator shown in table when active
+string udf_src = udf_mode ? " [UDF]" : " [Manual]"
 
 // ── Background tint ───────────────────────────────────────────────────────────
 bgcolor(i_bg_tint and in_asm ? color.new(color.red, 92) : na,
         title = "ASM background tint")
 
 // ── Labels on last bar ────────────────────────────────────────────────────────
-// var + delete pattern: keeps max 2 live labels regardless of bar count → no overflow
 var label lbl_band = na
 var label lbl_asm  = na
 
 if barstate.islast
-    // Band label — sits just above the last bar
     if i_show_band
         label.delete(lbl_band)
         lbl_band := label.new(
@@ -106,9 +172,10 @@ if barstate.islast
              textcolor = in_asm ? i_asm_col : i_band_col,
              size      = size.normal,
              tooltip   = sym + "  |  Band: " + band_disp
-                       + (in_asm ? "  |  ASM: " + asm_disp : ""))
+                       + (in_asm ? "  |  ASM: " + asm_disp : "")
+                       + (udf_mode ? "  |  Lower: " + str.tostring(r_lower_band, "#.##")
+                                   + "  Upper: "    + str.tostring(r_upper_band, "#.##") : ""))
 
-    // ASM label — sits just below the last bar (only when in ASM)
     if i_show_asm and in_asm
         label.delete(lbl_asm)
         lbl_asm := label.new(
@@ -122,9 +189,8 @@ if barstate.islast
              tooltip   = asm_detail != "" ? asm_detail : asm_disp)
 
 // ── Info table — bottom right ─────────────────────────────────────────────────
-// var table: created once, cells updated on every last bar
 var table tbl = table.new(
-     position.bottom_right, 2, 6,
+     position.bottom_right, 2, 8,
      bgcolor      = color.new(color.black, 72),
      border_width = 1,
      border_color = color.new(color.gray,  55),
@@ -135,7 +201,7 @@ if barstate.islast and i_show_table
     color hdr_bg = color.new(color.navy, 58)
 
     // Row 0: header
-    table.cell(tbl, 0, 0, "NSE Info",
+    table.cell(tbl, 0, 0, "NSE Info" + udf_src,
                text_color = color.silver, text_size = size.small, bgcolor = hdr_bg)
     table.cell(tbl, 1, 0, sym,
                text_color = color.white,  text_size = size.small, bgcolor = hdr_bg)
@@ -149,39 +215,57 @@ if barstate.islast and i_show_table
     table.cell(tbl, 0, 2, "Band %",
                text_color = color.gray,   text_size = size.small)
     table.cell(tbl, 1, 2,
-               i_band_pct > 0 ? str.tostring(i_band_pct, "#.##") + "%" : "\u2014",
+               r_band_pct > 0 ? str.tostring(r_band_pct, "#.##") + "%" : "\u2014",
                text_color = color.white,  text_size = size.small)
-    // Row 3: ASM status
-    table.cell(tbl, 0, 3, "ASM",
+    // Row 3: Lower band price (UDF only)
+    table.cell(tbl, 0, 3, "Lower ₹",
                text_color = color.gray,   text_size = size.small)
-    table.cell(tbl, 1, 3, in_asm ? asm_disp : "Clear",
-               text_color = in_asm ? i_asm_col : i_ok_col,
-               text_size  = size.small)
-    // Row 4: ASM detail
-    table.cell(tbl, 0, 4, "Type/Stage",
+    table.cell(tbl, 1, 3,
+               r_lower_band > 0 ? str.tostring(r_lower_band, "#.##") : "\u2014",
+               text_color = color.white,  text_size = size.small)
+    // Row 4: Upper band price (UDF only)
+    table.cell(tbl, 0, 4, "Upper ₹",
                text_color = color.gray,   text_size = size.small)
     table.cell(tbl, 1, 4,
+               r_upper_band > 0 ? str.tostring(r_upper_band, "#.##") : "\u2014",
+               text_color = color.white,  text_size = size.small)
+    // Row 5: ASM status
+    table.cell(tbl, 0, 5, "ASM",
+               text_color = color.gray,   text_size = size.small)
+    table.cell(tbl, 1, 5, in_asm ? asm_disp : "Clear",
+               text_color = in_asm ? i_asm_col : i_ok_col,
+               text_size  = size.small)
+    // Row 6: ASM detail
+    table.cell(tbl, 0, 6, "Type/Stage",
+               text_color = color.gray,   text_size = size.small)
+    table.cell(tbl, 1, 6,
                asm_detail != "" ? asm_detail : "\u2014",
                text_color = in_asm ? i_asm_col : color.gray,
                text_size  = size.small)
-    // Row 5: ASM type classification
-    table.cell(tbl, 0, 5, "Category",
+    // Row 7: Category
+    table.cell(tbl, 0, 7, "Category",
                text_color = color.gray,   text_size = size.small)
     string cat = in_stasm ? "Short-Term ASM"
                : in_ltasm ? "Long-Term ASM"
                : in_gsm   ? "GSM"
                : "\u2014"
-    table.cell(tbl, 1, 5, cat,
+    table.cell(tbl, 1, 7, cat,
                text_color = in_asm ? i_asm_col : color.gray,
                text_size  = size.small)
 
 // ── Pine Screener compatible plots (display=none) ─────────────────────────────
 // Use in Screener conditions:
-//   "Band PCT > 0"    → symbols with any circuit band
-//   "Band PCT == 20"  → 20% circuit stocks only
-//   "ASM Code > 0"    → any ASM stock
+//   "Band PCT > 0"            → symbols with any circuit band
+//   "Band PCT == 20"          → 20% circuit stocks only
+//   "ASM Code > 0"            → any ASM stock
 //   "ASM Code >= 11 and ASM Code <= 13" → STASM only
-//   "ASM Code >= 21 and ASM Code <= 29" → LTASM only (all stages)
-//   "ASM Code == 30"  → GSM only
-plot(i_band_pct,  title = "Band PCT",  display = display.none, editable = false)
-plot(i_asm_code,  title = "ASM Code",  display = display.none, editable = false)
+//   "ASM Code >= 21 and ASM Code <= 29" → LTASM only
+//   "ASM Code == 30"          → GSM only
+//   "Lower Band > 0"          → UDF: lower circuit price available
+//   "Upper Band > 0"          → UDF: upper circuit price available
+//   "Last Price > 0"          → UDF: last traded price available
+plot(r_band_pct,    title = "Band PCT",    display = display.none, editable = false)
+plot(r_asm_code,    title = "ASM Code",    display = display.none, editable = false)
+plot(r_lower_band,  title = "Lower Band",  display = display.none, editable = false)
+plot(r_upper_band,  title = "Upper Band",  display = display.none, editable = false)
+plot(r_last_price,  title = "Last Price",  display = display.none, editable = false)

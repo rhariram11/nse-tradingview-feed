@@ -35,11 +35,26 @@ import java.util.*;
  *
  * <h3>Outputs</h3>
  * <ul>
- *   <li>{@code data/nse_metadata.csv}  — single consolidated Pine seed file</li>
+ *   <li>{@code data/nse_metadata.csv}  — single consolidated Pine seed file (UNCHANGED)</li>
+ *   <li>{@code data/nse_udf_ohlc.csv}  — OHLC-packed feed for UDF server push</li>
  *   <li>{@code data/asm_state.csv}     — persisted ASM forward-fill store</li>
  *   <li>{@code data/nse_asm_full.csv}  — full daily ASM audit snapshot</li>
  *   <li>{@code data/cold_start.done}   — sentinel for run-mode detection</li>
  * </ul>
+ *
+ * <h3>OHLC field mapping (nse_udf_ohlc.csv)</h3>
+ * <pre>
+ *   open   = BAND_PCT
+ *   high   = LOWER_BAND
+ *   low    = UPPER_BAND
+ *   close  = ASM_CODE
+ *   volume = LAST_PRICE
+ * </pre>
+ *
+ * <h3>UDF push</h3>
+ * After writing nse_udf_ohlc.csv, the ETL POSTs it to the UDF server at
+ * {@code UDF_SERVER_URL/udf/bars/bulk}.  Set env var {@code UDF_SERVER_URL}
+ * to enable; leave unset for local runs without a server.
  *
  * <h3>CLI flags</h3>
  * {@code --force-full}  {@code --date YYYY-MM-DD}
@@ -76,11 +91,13 @@ public class Main {
 
         try (NseClient client = new NseClient()) {
 
-            DataMerger    merger      = new DataMerger();
-            SeedWriter    seedWriter  = new SeedWriter(DATA_DIR);
-            AsmStateStore asmStore    = new AsmStateStore(DATA_DIR);
-            AsmDownloader asmDl       = new AsmDownloader(client);
-            AsmFullWriter asmFullWr   = new AsmFullWriter(DATA_DIR);
+            DataMerger       merger      = new DataMerger();
+            SeedWriter       seedWriter  = new SeedWriter(DATA_DIR);
+            OhlcExportWriter ohlcWriter  = new OhlcExportWriter(DATA_DIR);
+            UdfPusher        udfPusher   = new UdfPusher(DATA_DIR);
+            AsmStateStore    asmStore    = new AsmStateStore(DATA_DIR);
+            AsmDownloader    asmDl       = new AsmDownloader(client);
+            AsmFullWriter    asmFullWr   = new AsmFullWriter(DATA_DIR);
 
             // ── COLD-START ──────────────────────────────────────────────────
             if (coldStart) {
@@ -101,8 +118,14 @@ public class Main {
                 asmStore.save(asmMap);
                 asmFullWr.write(tradeDate, asmMap);
 
-                // Write single consolidated seed file
-                seedWriter.write(merger.mergeFull(priceBands, asmMap));
+                // Write consolidated seed file (nse_metadata.csv — never altered below)
+                List<MergedRecord> merged = merger.mergeFull(priceBands, asmMap);
+                seedWriter.write(merged);
+
+                // Write OHLC export CSV + push to UDF server
+                ohlcWriter.write(merged);
+                udfPusher.push();
+
                 writeSentinel(tradeDate);
 
             } else {
@@ -124,8 +147,6 @@ public class Main {
                  * FORWARD-FILL RULE:
                  * If the session API returned nothing (blocked/maintenance),
                  * keep ALL symbols from the previous day's persisted state.
-                 * This ensures LTASM symbols that haven't changed their band
-                 * are never silently zeroed out in the seed file.
                  */
                 Map<String, AsmRecord> effectiveAsm =
                         freshAsmMap.isEmpty() ? prevAsmMap : freshAsmMap;
@@ -136,10 +157,18 @@ public class Main {
                 asmFullWr.write(tradeDate, effectiveAsm);
 
                 if (!deltaMap.isEmpty() || !effectiveAsm.isEmpty()) {
-                    seedWriter.write(
-                            merger.mergeDelta(deltaMap, effectiveAsm, prevAsmMap));
+                    List<MergedRecord> deltaRecords =
+                            merger.mergeDelta(deltaMap, effectiveAsm, prevAsmMap);
+
+                    // nse_metadata.csv — full upsert (unchanged contract)
+                    seedWriter.write(deltaRecords);
+
+                    // Write OHLC export CSV + push to UDF server
+                    ohlcWriter.write(deltaRecords);
+                    udfPusher.push();
+
                 } else {
-                    log.info("No changes detected — nothing to write to nse_metadata.csv.");
+                    log.info("No changes detected — nothing to write.");
                 }
             }
         }
@@ -151,12 +180,6 @@ public class Main {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /**
-     * Downloads ASM from the session API.
-     * Falls back to REMARKS derivation when the API returns empty AND delta
-     * records are available.  Full forward-fill from asm_state is handled
-     * in the DELTA branch above (not here — separation of concerns).
-     */
     private static Map<String, AsmRecord> downloadAsmSafe(
             AsmDownloader asmDl,
             Map<String, PriceBandRecord> deltaMap,
@@ -176,11 +199,11 @@ public class Main {
     }
 
     private static boolean sentinelExists() {
-        return Files.exists(Paths.get(SENTINEL_FILE));
+        return java.nio.file.Files.exists(java.nio.file.Paths.get(SENTINEL_FILE));
     }
 
     private static void writeSentinel(LocalDate date) throws IOException {
-        Path p = Paths.get(SENTINEL_FILE);
+        java.nio.file.Path p = java.nio.file.Paths.get(SENTINEL_FILE);
         Files.createDirectories(p.getParent());
         Files.writeString(p,
                 "Last full extract: " + date + "\n" +
