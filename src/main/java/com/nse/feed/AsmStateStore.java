@@ -30,6 +30,12 @@ import java.util.Map;
  * </pre>
  *
  * Written atomically (.tmp → rename).
+ * <p>
+ * Note: The state file stores only the 5 essential fields (symbol, isin, type,
+ * stage, stageCode). The full {@link AsmRecord} has additional fields
+ * (companyName, asOfDate, circRevision) that are NOT persisted here — they are
+ * populated with empty/zero defaults on load and refreshed on the next full API
+ * pull. Use {@link AsmRecord#of} factory to reconstruct records safely.
  */
 public class AsmStateStore {
 
@@ -67,6 +73,7 @@ public class AsmStateStore {
                 String isin   = p[1].trim();
                 String type   = p[2].trim();
                 String stage  = p[3].trim();
+                int circRevision = 0;
                 AsmStageCode code;
                 try {
                     int raw = Integer.parseInt(p[4].trim());
@@ -74,7 +81,19 @@ public class AsmStateStore {
                 } catch (NumberFormatException e) {
                     code = AsmStageCode.encode(type, stage);
                 }
-                map.put(symbol, new AsmRecord(symbol, isin, type, stage, code));
+                // companyName and asOfDate are not stored in the state file;
+                // use empty-string defaults — they will be overwritten on the
+                // next successful full API pull via AsmDownloader.
+                map.put(symbol, new AsmRecord(
+                        symbol,       // symbol
+                        "",           // companyName — not in state file
+                        isin,         // isin
+                        type,         // type
+                        stage,        // stage
+                        "",           // asOfDate — not in state file
+                        circRevision, // circRevision — not in state file, default 0
+                        code          // stageCode
+                ));
             }
         } catch (IOException e) {
             log.warn("[AsmState] Load failed: {}. Using empty map.", e.getMessage());
