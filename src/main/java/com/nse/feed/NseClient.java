@@ -5,6 +5,7 @@ import org.apache.hc.client5.http.cookie.BasicCookieStore;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.core5.http.ParseException;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -210,7 +211,7 @@ public class NseClient implements AutoCloseable {
      * Returns response body as UTF-8 String, or null on 404/403.
      * Throws IOException on other non-200 statuses.
      */
-    public String getArchiveText(String url) throws IOException {
+    public String getArchiveText(String url) throws IOException, ParseException {
         try (CloseableHttpResponse resp = http.execute(buildGet(url, null))) {
             int status = resp.getCode();
             if (status == 200) {
@@ -236,7 +237,7 @@ public class NseClient implements AutoCloseable {
      * GET with session cookies (for nseindia.com /api/* endpoints).
      * Returns response body, or null on 404/403/401.
      */
-    public String getWithSession(String url, String refererPath) throws IOException {
+    public String getWithSession(String url, String refererPath) throws IOException, ParseException {
         HttpGet req = buildGet(url, refererPath);
         req.setHeader("Accept", "application/json, text/plain, */*");
         req.setHeader("X-Requested-With", "XMLHttpRequest");

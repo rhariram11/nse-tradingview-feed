@@ -94,9 +94,6 @@ public class DataMerger {
         for (Map.Entry<String, AsmRecord> entry : asmMap.entrySet()) {
             String symbol = entry.getKey();
             if (!deltaMap.containsKey(symbol)) {
-                // Symbol is in today's ASM list but had no band change.
-                // Emit a row with bandPct=0 so Pine Script sees the new ASM flag.
-                // SeedWriter deduplication will prevent duplicate-date rows on re-run.
                 AsmRecord asm = entry.getValue();
                 log.debug("[Merge] ASM-status row for (no band change): {}", symbol);
                 merged.add(new MergedRecord(
@@ -129,19 +126,20 @@ public class DataMerger {
             PriceBandRecord pb,
             Map<String, AsmRecord> asmMap) {
 
-        AsmRecord asm   = asmMap.getOrDefault(pb.symbol(), null);
+        // PriceBandRecord is a POJO — all accessors use get* prefix
+        AsmRecord asm   = asmMap.getOrDefault(pb.getSymbol(), null);
         int    asmCode  = asm != null ? asm.stageCode() : 0;
         String asmType  = asm != null ? asm.type()      : "NONE";
         String asmStage = asm != null ? asm.stage()     : "";
 
         return new MergedRecord(
                 date,
-                pb.symbol(),
-                pb.series(),
-                pb.prevClose(),
-                pb.lowerBand(),
-                pb.upperBand(),
-                pb.bandPercent(),
+                pb.getSymbol(),      // was pb.symbol()
+                pb.getSeries(),      // was pb.series()
+                pb.getLastPrice(),   // was pb.prevClose() — field is lastPrice
+                pb.getLowerBand(),   // was pb.lowerBand()
+                pb.getUpperBand(),   // was pb.upperBand()
+                pb.getBandPct(),     // was pb.bandPercent() — field is bandPct
                 asmCode,
                 asmType,
                 asmStage);
