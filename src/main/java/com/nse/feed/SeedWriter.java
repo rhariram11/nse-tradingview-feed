@@ -4,128 +4,113 @@ import com.nse.feed.model.MergedRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.*;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.List;
 
 /**
- * Writes NSE metadata in TradingView {@code request.seed()} format.
+ * Writes all MergedRecords to the single consolidated seed file:
+ * {@code data/nse_metadata.csv}
  *
- * <h3>Two output strategies (both run simultaneously)</h3>
- * <ol>
- *   <li><b>NSE_METADATA.csv</b> — consolidated file: one row per symbol per date.
- *       Load in Pine via a fixed anchor ticker.  1 file, no 2000+ file explosion.</li>
- *   <li><b>data/{SYMBOL}.csv</b> — per-symbol files.
- *       Works directly with {@code request.seed(repo, syminfo.ticker, ...)}.</li>
- * </ol>
+ * <h3>Why a single file (not per-symbol)</h3>
+ * Per-symbol files would create 2 000+ small files — slow CI checkout,
+ * expensive file-system operations, messy git history.  A single CSV is
+ * read once by Pine's webhook receiver or a lookup service.
  *
- * <h3>Seed CSV column mapping</h3>
+ * <h3>CSV column contract (Pine reads by column name — order is the contract)</h3>
  * <pre>
- *   date   = trade date (yyyy-MM-dd)
- *   open   = previous close
- *   high   = upper circuit price level  (0 = none)
- *   low    = lower circuit price level  (0 = none)
- *   close  = band %  (5 / 10 / 20; 0 = no static band / F&O)
- *   volume = ASM stage code (see AsmStageCode)
+ *   DATE, SYMBOL, SERIES, LAST_PRICE, LOWER_BAND, UPPER_BAND,
+ *   BAND_PCT, BAND_LABEL, ASM_CODE, ASM_TYPE, ASM_STAGE, ASM_LABEL
  * </pre>
+ *
+ * <ul>
+ *   <li>BAND_LABEL  — "20%", "5%", "No Band" (exact NSE string)</li>
+ *   <li>ASM_CODE    — 0 / 11 / 12 / 13 / 21 / 22 / 23 / 30</li>
+ *   <li>ASM_LABEL   — "STASM-I", "LTASM-II", "GSM", "" (empty = not in ASM)</li>
+ * </ul>
+ *
+ * Written atomically (.tmp → rename) — never partially visible.
  */
 public class SeedWriter {
 
     private static final Logger log = LoggerFactory.getLogger(SeedWriter.class);
-    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
-    public static final String CONSOLIDATED_FILENAME = "NSE_METADATA.csv";
-    private static final String CONSOLIDATED_HEADER  = "date,symbol,series,open,high,low,close,volume";
-    private static final String PER_SYMBOL_HEADER    = "date,open,high,low,close,volume";
+    private static final String FEED_FILE     = "nse_metadata.csv";
+    private static final String FEED_FILE_TMP = "nse_metadata.csv.tmp";
 
-    private final Path    dataDir;
-    private final boolean writePerSymbol;
+    private static final String HEADER =
+            "DATE,SYMBOL,SERIES,LAST_PRICE,LOWER_BAND,UPPER_BAND," +
+            "BAND_PCT,BAND_LABEL,ASM_CODE,ASM_TYPE,ASM_STAGE,ASM_LABEL";
 
-    public SeedWriter(String dataDirPath, boolean writePerSymbol) throws IOException {
-        this.dataDir        = Paths.get(dataDirPath);
-        this.writePerSymbol = writePerSymbol;
-        Files.createDirectories(dataDir);
+    private final Path dataDir;
+
+    public SeedWriter(String dataDir) {
+        this.dataDir = Paths.get(dataDir);
     }
 
-    public SeedWriter(String dataDirPath) throws IOException {
-        this(dataDirPath, true);
-    }
-
+    /**
+     * Atomically writes all records to {@code data/nse_metadata.csv}.
+     * On DELTA runs the caller is responsible for merging the delta into
+     * the full set before calling this method.
+     */
     public void write(List<MergedRecord> records) throws IOException {
-        if (records.isEmpty()) { log.info("[SeedWriter] Nothing to write."); return; }
-        writeConsolidated(records);
-        if (writePerSymbol) writePerSymbol(records);
-    }
+        Files.createDirectories(dataDir);
+        Path tmp    = dataDir.resolve(FEED_FILE_TMP);
+        Path output = dataDir.resolve(FEED_FILE);
 
-    // ── Consolidated ──────────────────────────────────────────────────────────
-
-    private void writeConsolidated(List<MergedRecord> records) throws IOException {
-        Path file    = dataDir.resolve(CONSOLIDATED_FILENAME);
-        boolean isNew = !Files.exists(file);
-        Set<String> existing = isNew ? Collections.emptySet() : loadExistingKeys(file);
-
-        int written = 0;
         try (BufferedWriter bw = Files.newBufferedWriter(
-                file, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
-            if (isNew) { bw.write(CONSOLIDATED_HEADER); bw.newLine(); }
+                tmp, StandardCharsets.UTF_8,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            bw.write(HEADER);
+            bw.newLine();
+
             for (MergedRecord r : records) {
-                String key = r.date().format(DATE_FMT) + "|" + r.symbol();
-                if (existing.contains(key)) continue;
-                bw.write(String.format("%s,%s,%s,%.2f,%.2f,%.2f,%.2f,%d",
-                    r.date().format(DATE_FMT), r.symbol(), r.series(),
-                    r.prevClose(), r.upperBand(), r.lowerBand(),
-                    r.bandPct(), r.asmCode()));
+                bw.write(toRow(r));
                 bw.newLine();
-                written++;
             }
         }
-        log.info("[SeedWriter] Consolidated: {} rows.", written);
+
+        Files.move(tmp, output,
+                StandardCopyOption.REPLACE_EXISTING,
+                StandardCopyOption.ATOMIC_MOVE);
+
+        log.info("[SeedWriter] {} records → {}", records.size(), output.toAbsolutePath());
     }
 
-    private Set<String> loadExistingKeys(Path file) throws IOException {
-        Set<String> keys = new HashSet<>();
-        try (BufferedReader br = Files.newBufferedReader(file)) {
-            br.readLine();
-            String line;
-            while ((line = br.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) continue;
-                int c1 = line.indexOf(','), c2 = line.indexOf(',', c1 + 1);
-                if (c1 < 0 || c2 < 0) continue;
-                keys.add(line.substring(0, c1) + "|" + line.substring(c1 + 1, c2));
-            }
-        }
-        return keys;
+    // ── Row formatting ────────────────────────────────────────────────────────
+
+    private String toRow(MergedRecord r) {
+        return String.join(",",
+                r.date().toString(),
+                esc(r.symbol()),
+                esc(r.series()),
+                fmt(r.lastPrice()),
+                fmt(r.lowerBand()),
+                fmt(r.upperBand()),
+                fmt(r.bandPct()),
+                esc(r.bandLabel()),
+                String.valueOf(r.asmCode().code),
+                esc(r.asmType()),
+                esc(r.asmStage()),
+                esc(r.asmLabel()));
     }
 
-    // ── Per-symbol ────────────────────────────────────────────────────────────
-
-    private void writePerSymbol(List<MergedRecord> records) throws IOException {
-        int written = 0;
-        for (MergedRecord r : records) {
-            Path file  = dataDir.resolve(r.symbol() + ".csv");
-            boolean isNew = !Files.exists(file);
-            if (!isNew && dateAlreadyExists(file, r.date().format(DATE_FMT))) continue;
-            try (BufferedWriter bw = Files.newBufferedWriter(
-                    file, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
-                if (isNew) { bw.write(PER_SYMBOL_HEADER); bw.newLine(); }
-                bw.write(String.format("%s,%.2f,%.2f,%.2f,%.2f,%d",
-                    r.date().format(DATE_FMT),
-                    r.prevClose(), r.upperBand(), r.lowerBand(),
-                    r.bandPct(), r.asmCode()));
-                bw.newLine();
-                written++;
-            }
-        }
-        log.info("[SeedWriter] Per-symbol: {} files.", written);
+    /** Formats a double: whole numbers as integers, others to 2dp. */
+    private String fmt(double v) {
+        return (v == Math.floor(v) && !Double.isInfinite(v))
+               ? String.valueOf((long) v)
+               : String.format("%.2f", v);
     }
 
-    private boolean dateAlreadyExists(Path file, String dateStr) throws IOException {
-        List<String> lines = Files.readAllLines(file);
-        int start = Math.max(0, lines.size() - 5);
-        for (int i = start; i < lines.size(); i++)
-            if (lines.get(i).startsWith(dateStr)) return true;
-        return false;
+    /** CSV-escapes a string only when it contains commas or double-quotes. */
+    private String esc(String s) {
+        if (s == null) return "";
+        if (s.contains(",") || s.contains("\""))
+            return "\"" + s.replace("\"", "\"\"") + "\"";
+        return s;
     }
 }

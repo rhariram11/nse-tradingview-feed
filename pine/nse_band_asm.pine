@@ -1,0 +1,186 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// NSE Price Band & ASM Info
+// Reads band % and ASM surveillance status from the Java ETL output.
+//
+// ETL produces: data/nse_metadata.csv  (single consolidated file)
+// Audit file  : data/nse_asm_full.csv  (full daily ASM snapshot)
+//
+// DISPLAY:
+//   • Info table  : bottom-right — Symbol | Band | ASM status + stage
+//   • Band label  : above last bar (orange or red when in ASM)
+//   • ASM label   : below last bar (red, only when in ASM)
+//   • Bg tint     : subtle red background on all bars when symbol in ASM
+//   • Screener    : Band PCT + ASM Code plots (display=none, Pine Screener ready)
+//
+// SETUP:
+//   1. Run Java ETL daily at 09:15 IST → generates data/nse_metadata.csv
+//   2. Host nse_metadata.csv at a public HTTPS URL
+//   3. Send a TradingView webhook alert with:
+//        BAND_LABEL=20% | BAND_PCT=20 | ASM_LABEL=STASM-I | ASM_CODE=11
+//      → Pine input overrides are updated from the alert message
+//   4. Alternatively: update the override inputs manually each morning
+//
+// ASM_CODE reference (matches AsmStageCode.java exactly):
+//   0  = not in ASM
+//   11 = STASM Stage I    12 = STASM Stage II    13 = STASM Stage III
+//   21 = LTASM Stage I    22 = LTASM Stage II    23 = LTASM Stage III
+//   30 = GSM
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("NSE Band & ASM Info", shorttitle = "NSE-BAND-ASM",
+          overlay = true, max_labels_count = 10, max_tables_count = 1)
+
+// ── Input groups ─────────────────────────────────────────────────────────────
+string G_DATA    = "Data (populated by ETL webhook or manual daily update)"
+string G_DISPLAY = "Display"
+string G_COLOURS = "Colours"
+
+// ── Data override inputs ──────────────────────────────────────────────────────
+string i_band_label = input.string("",   "Band Label",
+                        tooltip = "e.g. 20%  — exact NSE string",
+                        group   = G_DATA)
+float  i_band_pct   = input.float(0.0,  "Band % (numeric)",
+                        minval  = 0, step = 1,
+                        tooltip = "e.g. 20 for a 20% circuit",
+                        group   = G_DATA)
+string i_asm_label  = input.string("",   "ASM Label",
+                        tooltip = "e.g. STASM-I  /  LTASM-II  /  GSM",
+                        group   = G_DATA)
+string i_asm_type   = input.string("",   "ASM Type",
+                        tooltip = "STASM / LTASM / GSM — raw type field",
+                        group   = G_DATA)
+string i_asm_stage  = input.string("",   "ASM Stage",
+                        tooltip = "I / II / III / IV",
+                        group   = G_DATA)
+int    i_asm_code   = input.int(0,       "ASM Code",
+                        tooltip = "0=none  11=STASM-I  12=STASM-II  21=LTASM-I  22=LTASM-II  30=GSM",
+                        group   = G_DATA)
+
+// ── Display toggles ───────────────────────────────────────────────────────────
+bool  i_show_band  = input.bool(true,  "Show Band label",    group = G_DISPLAY)
+bool  i_show_asm   = input.bool(true,  "Show ASM label",     group = G_DISPLAY)
+bool  i_show_table = input.bool(true,  "Show info table",    group = G_DISPLAY)
+bool  i_bg_tint    = input.bool(true,  "Red bg tint in ASM", group = G_DISPLAY)
+
+// ── Colours ───────────────────────────────────────────────────────────────────
+color i_band_col = input.color(color.new(color.orange, 0), "Band colour",   group = G_COLOURS)
+color i_asm_col  = input.color(color.new(color.red,    0), "ASM colour",    group = G_COLOURS)
+color i_ok_col   = input.color(color.new(color.teal,   0), "Normal colour", group = G_COLOURS)
+
+// ── Derived ───────────────────────────────────────────────────────────────────
+string sym      = syminfo.ticker
+bool   in_asm   = i_asm_code > 0 or i_asm_label != ""
+bool   in_stasm = i_asm_code >= 11 and i_asm_code <= 13
+bool   in_ltasm = i_asm_code >= 21 and i_asm_code <= 23
+bool   in_gsm   = i_asm_code == 30
+
+// Display strings
+string band_disp = i_band_label != "" ? i_band_label
+                 : i_band_pct   >  0  ? str.tostring(i_band_pct, "#.##") + "%"
+                 : "No Band"
+string asm_disp  = i_asm_label  != "" ? "\u26A0 " + i_asm_label   // ⚠ + label
+                 : in_asm            ? "\u26A0 ASM"
+                 : ""
+string asm_detail = i_asm_type != "" ? i_asm_type + " Stage " + i_asm_stage : ""
+
+// ── Background tint ───────────────────────────────────────────────────────────
+bgcolor(i_bg_tint and in_asm ? color.new(color.red, 92) : na,
+        title = "ASM background tint")
+
+// ── Labels on last bar ────────────────────────────────────────────────────────
+// var + delete pattern: keeps max 2 live labels regardless of bar count → no overflow
+var label lbl_band = na
+var label lbl_asm  = na
+
+if barstate.islast
+    // Band label — sits just above the last bar
+    if i_show_band
+        label.delete(lbl_band)
+        lbl_band := label.new(
+             x         = bar_index,
+             y         = high * 1.0015,
+             text      = band_disp,
+             style     = label.style_label_down,
+             color     = color.new(in_asm ? i_asm_col : i_band_col, 80),
+             textcolor = in_asm ? i_asm_col : i_band_col,
+             size      = size.normal,
+             tooltip   = sym + "  |  Band: " + band_disp
+                       + (in_asm ? "  |  ASM: " + asm_disp : ""))
+
+    // ASM label — sits just below the last bar (only when in ASM)
+    if i_show_asm and in_asm
+        label.delete(lbl_asm)
+        lbl_asm := label.new(
+             x         = bar_index,
+             y         = low * 0.9985,
+             text      = asm_disp,
+             style     = label.style_label_up,
+             color     = color.new(i_asm_col, 78),
+             textcolor = i_asm_col,
+             size      = size.normal,
+             tooltip   = asm_detail != "" ? asm_detail : asm_disp)
+
+// ── Info table — bottom right ─────────────────────────────────────────────────
+// var table: created once, cells updated on every last bar
+var table tbl = table.new(
+     position.bottom_right, 2, 6,
+     bgcolor      = color.new(color.black, 72),
+     border_width = 1,
+     border_color = color.new(color.gray,  55),
+     frame_width  = 1,
+     frame_color  = color.new(color.gray,  45))
+
+if barstate.islast and i_show_table
+    color hdr_bg = color.new(color.navy, 58)
+
+    // Row 0: header
+    table.cell(tbl, 0, 0, "NSE Info",
+               text_color = color.silver, text_size = size.small, bgcolor = hdr_bg)
+    table.cell(tbl, 1, 0, sym,
+               text_color = color.white,  text_size = size.small, bgcolor = hdr_bg)
+    // Row 1: Band label
+    table.cell(tbl, 0, 1, "Band",
+               text_color = color.gray,   text_size = size.small)
+    table.cell(tbl, 1, 1, band_disp,
+               text_color = in_asm ? i_asm_col : i_band_col,
+               text_size  = size.small)
+    // Row 2: Band % numeric
+    table.cell(tbl, 0, 2, "Band %",
+               text_color = color.gray,   text_size = size.small)
+    table.cell(tbl, 1, 2,
+               i_band_pct > 0 ? str.tostring(i_band_pct, "#.##") + "%" : "\u2014",
+               text_color = color.white,  text_size = size.small)
+    // Row 3: ASM status
+    table.cell(tbl, 0, 3, "ASM",
+               text_color = color.gray,   text_size = size.small)
+    table.cell(tbl, 1, 3, in_asm ? asm_disp : "Clear",
+               text_color = in_asm ? i_asm_col : i_ok_col,
+               text_size  = size.small)
+    // Row 4: ASM detail
+    table.cell(tbl, 0, 4, "Type/Stage",
+               text_color = color.gray,   text_size = size.small)
+    table.cell(tbl, 1, 4,
+               asm_detail != "" ? asm_detail : "\u2014",
+               text_color = in_asm ? i_asm_col : color.gray,
+               text_size  = size.small)
+    // Row 5: ASM type classification
+    table.cell(tbl, 0, 5, "Category",
+               text_color = color.gray,   text_size = size.small)
+    string cat = in_stasm ? "Short-Term ASM"
+               : in_ltasm ? "Long-Term ASM"
+               : in_gsm   ? "GSM"
+               : "\u2014"
+    table.cell(tbl, 1, 5, cat,
+               text_color = in_asm ? i_asm_col : color.gray,
+               text_size  = size.small)
+
+// ── Pine Screener compatible plots (display=none) ─────────────────────────────
+// Use in Screener conditions:
+//   "Band PCT > 0"    → symbols with any circuit band
+//   "Band PCT == 20"  → 20% circuit stocks only
+//   "ASM Code > 0"    → any ASM stock
+//   "ASM Code >= 11 and ASM Code <= 13" → STASM only
+//   "ASM Code >= 21 and ASM Code <= 23" → LTASM only
+//   "ASM Code == 30"  → GSM only
+plot(i_band_pct,  title = "Band PCT",  display = display.none, editable = false)
+plot(i_asm_code,  title = "ASM Code",  display = display.none, editable = false)

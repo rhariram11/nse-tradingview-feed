@@ -21,13 +21,27 @@ import java.util.*;
  *   <li>Full band master : nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv</li>
  *   <li>Delta changes    : nsearchives.nseindia.com/content/equities/eq_band_changes_{ddmmyyyy}.csv</li>
  *   <li>ASM (primary)   : nseindia.com/api/asm-securities?asmType=shortterm|longterm</li>
- *   <li>ASM (fallback)  : REMARKS column + persisted data/asm_state.csv</li>
+ *   <li>ASM (fallback)  : REMARKS column in eq_band_changes + persisted data/asm_state.csv</li>
  * </ul>
  *
  * <h3>Run modes</h3>
- * COLD-START (Monday / first run / --force-full) or DELTA (Tue–Fri).
+ * <ul>
+ *   <li>COLD-START: Monday / first run / {@code --force-full}<br>
+ *       Downloads full sec_list + full ASM. Writes complete nse_metadata.csv.</li>
+ *   <li>DELTA: Tuesday–Friday<br>
+ *       Downloads eq_band_changes + ASM. Forward-fills ASM from asm_state.csv
+ *       when the session API is blocked. Writes changed rows only (upsert).</li>
+ * </ul>
  *
- * <h3>CLI</h3>
+ * <h3>Outputs</h3>
+ * <ul>
+ *   <li>{@code data/nse_metadata.csv}  — single consolidated Pine seed file</li>
+ *   <li>{@code data/asm_state.csv}     — persisted ASM forward-fill store</li>
+ *   <li>{@code data/nse_asm_full.csv}  — full daily ASM audit snapshot</li>
+ *   <li>{@code data/cold_start.done}   — sentinel for run-mode detection</li>
+ * </ul>
+ *
+ * <h3>CLI flags</h3>
  * {@code --force-full}  {@code --date YYYY-MM-DD}
  */
 public class Main {
@@ -62,15 +76,13 @@ public class Main {
 
         try (NseClient client = new NseClient()) {
 
-            DataMerger    merger   = new DataMerger();
-            SeedWriter    writer   = new SeedWriter(DATA_DIR);
-            AsmStateStore asmStore = new AsmStateStore(DATA_DIR);
-            AsmDownloader asmDl    = new AsmDownloader(client);
+            DataMerger    merger      = new DataMerger();
+            SeedWriter    seedWriter  = new SeedWriter(DATA_DIR);
+            AsmStateStore asmStore    = new AsmStateStore(DATA_DIR);
+            AsmDownloader asmDl       = new AsmDownloader(client);
+            AsmFullWriter asmFullWr   = new AsmFullWriter(DATA_DIR);
 
-            // Previous day's ASM state for forward-fill
-            Map<String, AsmRecord> prevAsmMap = coldStart
-                    ? Collections.emptyMap() : asmStore.load();
-
+            // ── COLD-START ──────────────────────────────────────────────────
             if (coldStart) {
 
                 PriceBandDownloader pbDl = new PriceBandDownloader(client);
@@ -79,34 +91,55 @@ public class Main {
                     log.warn("sec_list empty — public holiday? Exiting.");
                     return;
                 }
-                log.info("Price band records: {}", priceBands.size());
+                log.info("Price band records loaded: {}", priceBands.size());
 
-                Map<String, AsmRecord> asmMap = downloadAsmSafe(asmDl, null, tradeDate);
+                Map<String, AsmRecord> asmMap = downloadAsmSafe(
+                        asmDl, null, tradeDate);
                 log.info("ASM records: {}", asmMap.size());
-                asmStore.save(asmMap);
 
-                writer.write(merger.mergeFull(priceBands, asmMap));
+                // Persist ASM state and write audit snapshot
+                asmStore.save(asmMap);
+                asmFullWr.write(tradeDate, asmMap);
+
+                // Write single consolidated seed file
+                seedWriter.write(merger.mergeFull(priceBands, asmMap));
                 writeSentinel(tradeDate);
 
             } else {
 
-                DeltaBandUpdater delta = new DeltaBandUpdater(client);
-                Map<String, PriceBandRecord> deltaMap = delta.downloadAndParse(tradeDate);
+            // ── DELTA ───────────────────────────────────────────────────────
+
+                // Load yesterday's persisted ASM state for forward-fill
+                Map<String, AsmRecord> prevAsmMap = asmStore.load();
+
+                DeltaBandUpdater delta   = new DeltaBandUpdater(client);
+                Map<String, PriceBandRecord> deltaMap =
+                        delta.downloadAndParse(tradeDate);
                 log.info("Band changes: {}", deltaMap.size());
 
-                Map<String, AsmRecord> freshAsmMap = downloadAsmSafe(asmDl, deltaMap, tradeDate);
+                Map<String, AsmRecord> freshAsmMap =
+                        downloadAsmSafe(asmDl, deltaMap, tradeDate);
 
-                // Forward-fill: if session API returned nothing, keep previous state
+                /*
+                 * FORWARD-FILL RULE:
+                 * If the session API returned nothing (blocked/maintenance),
+                 * keep ALL symbols from the previous day's persisted state.
+                 * This ensures LTASM symbols that haven't changed their band
+                 * are never silently zeroed out in the seed file.
+                 */
                 Map<String, AsmRecord> effectiveAsm =
                         freshAsmMap.isEmpty() ? prevAsmMap : freshAsmMap;
                 log.info("Effective ASM (after forward-fill): {}", effectiveAsm.size());
 
+                // Persist updated ASM state + write audit snapshot
                 asmStore.save(effectiveAsm);
+                asmFullWr.write(tradeDate, effectiveAsm);
 
                 if (!deltaMap.isEmpty() || !effectiveAsm.isEmpty()) {
-                    writer.write(merger.mergeDelta(deltaMap, effectiveAsm, prevAsmMap));
+                    seedWriter.write(
+                            merger.mergeDelta(deltaMap, effectiveAsm, prevAsmMap));
                 } else {
-                    log.info("No changes — nothing to write.");
+                    log.info("No changes detected — nothing to write to nse_metadata.csv.");
                 }
             }
         }
@@ -118,18 +151,25 @@ public class Main {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * Downloads ASM from the session API.
+     * Falls back to REMARKS derivation when the API returns empty AND delta
+     * records are available.  Full forward-fill from asm_state is handled
+     * in the DELTA branch above (not here — separation of concerns).
+     */
     private static Map<String, AsmRecord> downloadAsmSafe(
             AsmDownloader asmDl,
             Map<String, PriceBandRecord> deltaMap,
             LocalDate date) {
         Map<String, AsmRecord> map;
-        try { map = asmDl.download(date); }
-        catch (IOException e) {
+        try {
+            map = asmDl.download(date);
+        } catch (IOException e) {
             log.warn("[ASM] Download error: {}. Using empty.", e.getMessage());
             map = Collections.emptyMap();
         }
         if (map.isEmpty() && deltaMap != null && !deltaMap.isEmpty()) {
-            log.info("[ASM] Supplementing with REMARKS fallback.");
+            log.info("[ASM] Session API empty — supplementing with REMARKS fallback.");
             map = asmDl.deriveFromRemarks(deltaMap);
         }
         return map;
@@ -143,16 +183,16 @@ public class Main {
         Path p = Paths.get(SENTINEL_FILE);
         Files.createDirectories(p.getParent());
         Files.writeString(p,
-            "Last full extract: " + date + "\n" +
-            "Next full extract: next Monday or --force-full\n",
-            StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+                "Last full extract: " + date + "\n" +
+                "Next full extract: next Monday or --force-full\n",
+                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
     private static LocalDate parseDate(List<String> args) {
         int idx = args.indexOf("--date");
         if (idx >= 0 && idx + 1 < args.size()) {
             try { return LocalDate.parse(args.get(idx + 1)); }
-            catch (Exception e) { log.warn("Bad --date — using today IST."); }
+            catch (Exception e) { log.warn("Bad --date value — using today IST."); }
         }
         return LocalDate.now(ZoneId.of("Asia/Kolkata"));
     }

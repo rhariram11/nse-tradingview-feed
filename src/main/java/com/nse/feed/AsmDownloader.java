@@ -1,5 +1,7 @@
 package com.nse.feed;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nse.feed.model.AsmRecord;
 import com.nse.feed.model.AsmStageCode;
 import com.nse.feed.model.PriceBandRecord;
@@ -7,42 +9,33 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.time.LocalDate;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
  * Downloads and parses the NSE ASM surveillance list.
  *
  * <h3>Strategy (ordered by reliability)</h3>
  * <ol>
- *   <li><b>Session JSON API</b> — {@code /api/asm-securities?asmType=shortterm|longterm}
- *       Parsed with regex object extraction — no external JSON lib dependency.</li>
+ *   <li><b>Session JSON API</b> — {@code /api/asm-securities?asmType=shortterm|longterm}<br>
+ *       Parsed with Jackson ObjectMapper (replaces fragile regex scanner).</li>
  *   <li><b>REMARKS fallback</b> — derives ASM flags from the REMARKS column of
- *       eq_band_changes. Only covers stocks whose band changed that day.</li>
+ *       eq_band_changes. Only covers stocks whose band changed that day;
+ *       remaining symbols are forward-filled from the persisted asm_state.csv
+ *       via {@link AsmStateStore} in Main.</li>
  * </ol>
  *
- * <h3>Stage code encoding</h3>
- * All codes delegate to {@link AsmStageCode} — the single source of truth.
- * <pre>
- *   STASM: 11 / 12 / 13
- *   LTASM: 21 / 22 / 23  (non-overlapping range)
- *   GSM  : 30
- * </pre>
+ * <h3>Stage code contract</h3>
+ * All codes are canonical {@link AsmStageCode} enum values.
+ * Non-overlapping ranges: STASM 11-13, LTASM 21-23, GSM 30.
  */
 public class AsmDownloader {
 
     private static final Logger log = LoggerFactory.getLogger(AsmDownloader.class);
 
-    // Captures: "fieldName":"value" from a JSON object snippet
-    private static final Pattern FIELD_PAT =
-        Pattern.compile("\\\"([^\"]+)\\\"\\s*:\\s*\\\"([^\"]*)\\\"");
-
-    // Matches a single-level JSON object  { ... }
-    private static final Pattern OBJECT_PAT =
-        Pattern.compile("\\{[^{}]*\\}");
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final NseClient client;
 
@@ -53,11 +46,11 @@ public class AsmDownloader {
     // ── Public API ────────────────────────────────────────────────────────────
 
     /**
-     * Downloads both STASM and LTASM lists from the session API.
+     * Downloads STASM + LTASM lists from the NSE session API.
      *
-     * @return symbol → AsmRecord; EMPTY (never null) on any failure
+     * @return symbol → AsmRecord (EMPTY, never null, on any failure)
      */
-    public Map<String, AsmRecord> download(java.time.LocalDate date) throws IOException {
+    public Map<String, AsmRecord> download(LocalDate date) throws IOException {
         log.info("[ASM] Session API download for: {}", date);
 
         String json;
@@ -69,15 +62,41 @@ public class AsmDownloader {
         }
 
         if (json == null || json.isBlank()) {
-            log.warn("[ASM] Session API returned empty. Using empty map.");
+            log.warn("[ASM] Session API returned empty response.");
             return Collections.emptyMap();
         }
 
         Map<String, AsmRecord> result = new HashMap<>();
-        result.putAll(parseAsmHalf(json, "shortterm", "STASM"));
-        result.putAll(parseAsmHalf(json, "longterm",  "LTASM"));
-        if (result.isEmpty()) {
-            result.putAll(parseAsmObjectArray(json, "ASM"));
+        try {
+            JsonNode root = MAPPER.readTree(json);
+
+            // Combined wrapper: {"shortterm": [...], "longterm": [...]}
+            if (root.has("shortterm") || root.has("longterm")) {
+                parseHalf(root.path("shortterm"), "STASM", result);
+                parseHalf(root.path("longterm"),  "LTASM", result);
+            }
+            // Direct array: [{...}, ...]
+            else if (root.isArray()) {
+                parseArray(root, "ASM", result);
+            }
+            // {"data": [{...}, ...]}
+            else if (root.has("data")) {
+                JsonNode data = root.get("data");
+                if (data.isArray()) parseArray(data, "ASM", result);
+            }
+            // Single-key object whose value is an array
+            else {
+                root.fields().forEachRemaining(entry -> {
+                    if (entry.getValue().isArray()) {
+                        String keyType = entry.getKey().toUpperCase().contains("LONG") ? "LTASM" : "STASM";
+                        parseArray(entry.getValue(), keyType, result);
+                    }
+                });
+            }
+        } catch (Exception e) {
+            log.error("[ASM] Jackson parse error: {}. Raw snippet: {}",
+                    e.getMessage(), json.substring(0, Math.min(200, json.length())));
+            return Collections.emptyMap();
         }
 
         log.info("[ASM] Session API: {} ASM symbols.", result.size());
@@ -86,11 +105,10 @@ public class AsmDownloader {
 
     /**
      * Derives ASM flags from REMARKS text in the eq_band_changes delta file.
-     * Only covers stocks whose band changed that day.
+     * Only covers stocks whose band changed that day — all other symbols
+     * must be forward-filled from asm_state.csv (handled in Main).
      */
-    public Map<String, AsmRecord> deriveFromRemarks(
-            Map<String, PriceBandRecord> deltaMap) {
-
+    public Map<String, AsmRecord> deriveFromRemarks(Map<String, PriceBandRecord> deltaMap) {
         Map<String, AsmRecord> result = new HashMap<>();
         for (Map.Entry<String, PriceBandRecord> entry : deltaMap.entrySet()) {
             String symbol  = entry.getKey();
@@ -106,86 +124,71 @@ public class AsmDownloader {
         return Collections.unmodifiableMap(result);
     }
 
-    // ── JSON Parsing ──────────────────────────────────────────────────────────
+    // ── Jackson parsing helpers ───────────────────────────────────────────────
 
-    private Map<String, AsmRecord> parseAsmHalf(String json, String key, String defaultType) {
-        String keyToken = "\"" + key + "\"";
-        int keyIdx = json.indexOf(keyToken);
-        if (keyIdx < 0) return Collections.emptyMap();
-        int arrStart = json.indexOf('[', keyIdx);
-        if (arrStart < 0) return Collections.emptyMap();
-        int arrEnd = findMatchingBracket(json, arrStart, '[', ']');
-        if (arrEnd < 0) return Collections.emptyMap();
-        return parseAsmObjectArray(json.substring(arrStart, arrEnd + 1), defaultType);
+    /**
+     * Parses one half of the combined JSON response (shortterm or longterm array).
+     * Handles both wrapped ({"data":[...]}) and bare array formats.
+     */
+    private void parseHalf(JsonNode node, String defaultType, Map<String, AsmRecord> out) {
+        if (node.isMissingNode()) return;
+        // Node might be array directly, or {"data":[...]}
+        JsonNode arr = node.isArray() ? node
+                     : node.has("data") && node.get("data").isArray() ? node.get("data")
+                     : node;
+        if (arr.isArray()) parseArray(arr, defaultType, out);
     }
 
-    private Map<String, AsmRecord> parseAsmObjectArray(String json, String defaultType) {
-        Map<String, AsmRecord> map = new HashMap<>();
-        String payload = unwrapDataArray(json);
-        Matcher objM = OBJECT_PAT.matcher(payload);
-        while (objM.find()) {
-            String obj    = objM.group();
-            Map<String, String> fields = extractAllFields(obj);
-            String symbol = coalesce(fields, "symbol", "SYMBOL", "scrip", "SCRIP");
+    /**
+     * Iterates a JSON array of ASM objects, extracting symbol + stage.
+     * Field name variants handled: NSE's API has changed field names across years.
+     */
+    private void parseArray(JsonNode arr, String defaultType, Map<String, AsmRecord> out) {
+        if (!arr.isArray()) return;
+        for (JsonNode obj : arr) {
+            String symbol = firstNonBlank(obj,
+                    "symbol", "SYMBOL", "scrip", "scripCode", "SCRIP");
             if (symbol == null || symbol.isBlank()) continue;
             symbol = symbol.trim().toUpperCase();
-            String isin     = coalesce(fields, "isin", "ISIN");
-            String rawType  = coalesce(fields, "asmType", "asmtype", "type", "TYPE");
-            String rawStage = coalesce(fields, "asmStage", "asmstage", "stage", "STAGE");
-            if (rawType.isBlank())  rawType  = deriveType(obj.toUpperCase());
-            if (rawStage.isBlank()) rawStage = deriveStage(obj.toUpperCase());
+
+            String isin     = firstNonBlankOrEmpty(obj, "isin", "ISIN");
+            String rawType  = firstNonBlankOrEmpty(obj,
+                    "asmType", "asmtype", "surveillanceType", "type", "TYPE");
+            String rawStage = firstNonBlankOrEmpty(obj,
+                    "asmStage", "asmstage", "stage", "STAGE", "surveillanceStage");
+
+            // Derive type from field content when explicit field is absent
             if (rawType.isBlank())  rawType  = defaultType;
-            map.put(symbol, AsmRecord.of(symbol, isin == null ? "" : isin, rawType, rawStage));
+            if (rawStage.isBlank()) rawStage = deriveStage(obj.toString().toUpperCase());
+
+            out.put(symbol, AsmRecord.of(symbol, isin, rawType, rawStage));
         }
-        return map;
     }
 
-    private Map<String, String> extractAllFields(String obj) {
-        Map<String, String> fields = new HashMap<>();
-        Matcher m = FIELD_PAT.matcher(obj);
-        while (m.find()) fields.put(m.group(1), m.group(2));
-        return fields;
-    }
+    // ── Field extraction helpers ──────────────────────────────────────────────
 
-    private String coalesce(Map<String, String> fields, String... keys) {
+    private String firstNonBlank(JsonNode obj, String... keys) {
         for (String k : keys) {
-            String v = fields.get(k);
-            if (v != null && !v.isBlank()) return v;
+            JsonNode n = obj.get(k);
+            if (n != null && !n.isNull() && !n.asText().isBlank()) return n.asText();
         }
-        return "";
+        return null;
     }
 
-    private String unwrapDataArray(String json) {
-        for (String key : new String[]{"data", "records", "Data", "Records"}) {
-            int ki = json.indexOf("\"" + key + "\"");
-            if (ki < 0) continue;
-            int arrStart = json.indexOf('[', ki);
-            if (arrStart < 0) continue;
-            int arrEnd = findMatchingBracket(json, arrStart, '[', ']');
-            if (arrEnd >= 0) return json.substring(arrStart, arrEnd + 1);
-        }
-        return json;
+    private String firstNonBlankOrEmpty(JsonNode obj, String... keys) {
+        String v = firstNonBlank(obj, keys);
+        return v == null ? "" : v;
     }
 
-    private int findMatchingBracket(String s, int start, char open, char close) {
-        int depth = 0;
-        for (int i = start; i < s.length(); i++) {
-            if (s.charAt(i) == open)  depth++;
-            if (s.charAt(i) == close) depth--;
-            if (depth == 0) return i;
-        }
-        return -1;
-    }
-
-    // ── Type / Stage derivation ───────────────────────────────────────────────
+    // ── Type / Stage derivation from text ─────────────────────────────────────
 
     static String deriveType(String upper) {
-        if (upper.contains("LTASM"))                                 return "LTASM";
-        if (upper.contains("STASM"))                                 return "STASM";
+        if (upper.contains("LTASM"))                                      return "LTASM";
+        if (upper.contains("STASM"))                                      return "STASM";
         if (upper.contains("SHORTTERM") || upper.contains("SHORT TERM")) return "STASM";
         if (upper.contains("LONGTERM")  || upper.contains("LONG TERM"))  return "LTASM";
-        if (upper.contains("GSM"))                                   return "GSM";
-        if (upper.contains("ASM"))                                   return "ASM";
+        if (upper.contains("GSM"))                                        return "GSM";
+        if (upper.contains("ASM"))                                        return "STASM";
         return "";
     }
 

@@ -13,23 +13,17 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * Downloads and parses NSE daily delta band-change file.
+ * Downloads and parses NSE delta band-change file (eq_band_changes_{ddmmyyyy}.csv).
  *
- * Source  : https://nsearchives.nseindia.com/content/equities/eq_band_changes_{ddmmyyyy}.csv
+ * <h3>Verified CSV columns (live file)</h3>
+ * SYMBOL, SERIES, PRICE_BAND_NEW, PRICE_BAND_OLD, EFFECTIVE_DATE, REMARKS
  *
- * ── CRITICAL DATE RULE ────────────────────────────────────────────────────────
- * NSE names this file with the NEXT trading day's date — NOT today's.
- * Example: band changes effective Monday 19-May-2026 are published
- *          after Friday (16-May-2026) close in file eq_band_changes_19052026.csv
- * NseClient.downloadBandChanges() handles this by trying nextTradingDay(runDate) first.
+ * <h3>CRITICAL DATE RULE</h3>
+ * NSE labels this file with the NEXT trading day's date.
+ * {@link NseClient#downloadBandChanges} tries nextTradingDay(runDate) first.
  *
- * ── Actual CSV columns (verified from live file 18-May-2026) ──────────────────
- *   SYMBOL, SERIES, PRICE_BAND_NEW, PRICE_BAND_OLD, EFFECTIVE_DATE, REMARKS
- *
- * REMARKS contains ASM context, e.g.:
- *   "ASM Stage 1", "LTASM Stage II", "Price Band Change", "Short Term ASM"
- *
- * Returns EMPTY map on 404 / non-trading day (handled gracefully by Main).
+ * <p>bandLabel is preserved from PRICE_BAND_NEW for exact Pine display.
+ * REMARKS is retained for the ASM fallback derivation in {@link AsmDownloader}.
  */
 public class DeltaBandUpdater {
 
@@ -41,23 +35,16 @@ public class DeltaBandUpdater {
         this.client = client;
     }
 
-    /**
-     * Downloads and parses eq_band_changes CSV.
-     * NseClient handles the next-trading-day filename logic.
-     *
-     * @return symbol → PriceBandRecord (with REMARKS populated) for changed symbols;
-     *         EMPTY map if no changes or non-trading day.
-     */
-    public Map<String, PriceBandRecord> downloadAndParse(LocalDate runDate) throws IOException {
-        String csv = client.downloadBandChanges(runDate); // null on 404
+    // ── Public API ────────────────────────────────────────────────────────────
 
+    public Map<String, PriceBandRecord> downloadAndParse(LocalDate runDate) throws IOException {
+        String csv = client.downloadBandChanges(runDate);
         if (csv == null) {
-            log.info("[Delta] No eq_band_changes file available for runDate={}.", runDate);
+            log.info("[Delta] No eq_band_changes available for runDate={}.", runDate);
             return new HashMap<>();
         }
-
         Map<String, PriceBandRecord> changes = parseDeltaCsv(csv);
-        log.info("[Delta] {} symbol(s) with band changes for runDate={}.", changes.size(), runDate);
+        log.info("[Delta] {} band change(s) for runDate={}.", changes.size(), runDate);
         return changes;
     }
 
@@ -68,50 +55,50 @@ public class DeltaBandUpdater {
         try (CSVReader reader = new CSVReader(new StringReader(csv))) {
             String[] header = reader.readNext();
             if (header == null) return map;
-
-            log.debug("[Delta] CSV header: {}", String.join(",", header));
+            log.debug("[Delta] Header: {}", String.join(",", header));
 
             int idxSymbol  = findCol(header, "SYMBOL", "SCRIP");
             int idxSeries  = findCol(header, "SERIES");
-            // New column names from verified live file:
             int idxNewBand = findCol(header,
-                    "PRICE_BAND_NEW", "NEW_PRICE_BAND",  // verified live names
-                    "NEW_BAND", "NEW BAND", "NEWBAND",   // alternate names
-                    "PRICE BAND", "PRICEBAND", "PBAND"); // legacy names
+                    "PRICE_BAND_NEW", "NEW_PRICE_BAND",
+                    "NEW_BAND", "NEW BAND", "NEWBAND",
+                    "PRICE BAND", "PRICEBAND", "PBAND");
             int idxOldBand = findCol(header,
-                    "PRICE_BAND_OLD", "OLD_PRICE_BAND",  // verified live names
-                    "OLD_BAND", "OLD BAND", "OLDBAND");   // alternate names
-            int idxRemarks = findCol(header,
-                    "REMARKS", "REMARK", "REASON", "DESCRIPTION");
+                    "PRICE_BAND_OLD", "OLD_PRICE_BAND",
+                    "OLD_BAND", "OLD BAND", "OLDBAND");
+            int idxRemarks = findCol(header, "REMARKS", "REMARK", "REASON", "DESCRIPTION");
 
             if (idxSymbol < 0) {
                 log.warn("[Delta] SYMBOL column not found. Header: {}", String.join(",", header));
                 return map;
             }
-            if (idxNewBand < 0) {
-                log.warn("[Delta] New band column not found. Header: {}", String.join(",", header));
-            }
+            if (idxNewBand < 0)
+                log.warn("[Delta] New-band column not found. Header: {}", String.join(",", header));
 
             String[] row;
             while ((row = reader.readNext()) != null) {
                 if (row.length < 2) continue;
                 try {
-                    String symbol = clean(row[idxSymbol]);
+                    String symbol  = clean(row[idxSymbol]);
                     if (symbol.isEmpty()) continue;
-                    String series    = idxSeries  >= 0 ? clean(row[idxSeries])  : "EQ";
-                    double newBandPct = parseBandPct(row, idxNewBand);
-                    double oldBandPct = parseBandPct(row, idxOldBand);
-                    String remarks   = idxRemarks >= 0 ? row[idxRemarks].trim() : "";
+                    String series  = idxSeries >= 0 ? clean(row[idxSeries]) : "EQ";
+                    String rawNew  = (idxNewBand >= 0 && idxNewBand < row.length)
+                                     ? row[idxNewBand].trim() : "";
+                    String rawOld  = (idxOldBand >= 0 && idxOldBand < row.length)
+                                     ? row[idxOldBand].trim() : "";
+                    String newLabel = PriceBandDownloader.normaliseBandLabel(rawNew);
+                    String oldLabel = PriceBandDownloader.normaliseBandLabel(rawOld);
+                    double newPct   = parseBandPct(rawNew);
+                    String remarks  = (idxRemarks >= 0) ? row[idxRemarks].trim() : "";
 
-                    log.info("[Delta] Band change: {} {}% → {}%  [{}]",
-                            symbol, oldBandPct, newBandPct, remarks);
+                    log.info("[Delta] {} : {} → {}  [{}]", symbol, oldLabel, newLabel, remarks);
 
                     PriceBandRecord rec =
-                        new PriceBandRecord(symbol, series, 0.0, 0.0, 0.0, newBandPct);
+                            new PriceBandRecord(symbol, series, 0.0, 0.0, 0.0, newPct, newLabel);
                     rec.setRemarks(remarks);
                     map.put(symbol, rec);
                 } catch (Exception e) {
-                    log.debug("[Delta] Skipping row: {}", String.join(",", row));
+                    log.debug("[Delta] Skipping malformed row: {}", String.join(",", row));
                 }
             }
         } catch (CsvValidationException e) {
@@ -131,13 +118,10 @@ public class DeltaBandUpdater {
 
     private String clean(String s) { return s == null ? "" : s.trim().toUpperCase(); }
 
-    private double parseBandPct(String[] row, int idx) {
-        if (idx < 0 || idx >= row.length) return 0.0;
-        String val = row[idx].trim()
-                .replace("%", "")
-                .replace(",", "")
-                .trim();
-        if (val.isEmpty() || val.equals("-")
+    private double parseBandPct(String raw) {
+        if (raw == null) return 0.0;
+        String val = raw.trim().replace("%", "").replace(",", "").trim();
+        if (val.isEmpty() || val.equalsIgnoreCase("-")
                 || val.equalsIgnoreCase("NA")
                 || val.equalsIgnoreCase("NO BAND")
                 || val.equalsIgnoreCase("NONE")) return 0.0;

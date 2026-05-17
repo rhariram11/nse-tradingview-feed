@@ -5,58 +5,63 @@ package com.nse.feed.model;
  *
  * <pre>
  *  0        = no surveillance
- *  11-13    = STASM Stage I / II / III
- *  21-23    = LTASM Stage I / II / III      ← non-overlapping with STASM
+ *  11-13    = STASM Stage I / II / III     (short-term)
+ *  21-23    = LTASM Stage I / II / III     (long-term, NON-overlapping range)
  *  30       = GSM
  * </pre>
  *
- * Pine Script reads {@code volume} field from the seed CSV.
- * Match these constants in your Pine indicator:
+ * Pine Script reads the ASM_CODE column from nse_metadata.csv:
  * <pre>
- *   STASM_I   = 11, STASM_II  = 12, STASM_III = 13
- *   LTASM_I   = 21, LTASM_II  = 22, LTASM_III = 23
- *   GSM       = 30
+ *   int asm = asmCode
+ *   bool inStasm = asm >= 11 and asm <= 13
+ *   bool inLtasm = asm >= 21 and asm <= 23
+ *   bool inGsm   = asm == 30
+ *   bool inAsm   = asm > 0
  * </pre>
  */
-public final class AsmStageCode {
+public enum AsmStageCode {
 
-    public static final int NONE       = 0;
+    NONE      (0),
+    STASM_I   (11),
+    STASM_II  (12),
+    STASM_III (13),
+    LTASM_I   (21),
+    LTASM_II  (22),
+    LTASM_III (23),
+    GSM       (30);
 
-    // Short-Term ASM  (STASM)
-    public static final int STASM_I    = 11;
-    public static final int STASM_II   = 12;
-    public static final int STASM_III  = 13;
+    /** The integer written to the CSV / used in Pine. */
+    public final int code;
 
-    // Long-Term ASM (LTASM) — 20s range, NO overlap with STASM
-    public static final int LTASM_I    = 21;
-    public static final int LTASM_II   = 22;
-    public static final int LTASM_III  = 23;
+    AsmStageCode(int code) { this.code = code; }
 
-    // Graded Surveillance Measure
-    public static final int GSM        = 30;
+    // ── Static helpers ────────────────────────────────────────────────────────
 
-    private AsmStageCode() {}   // utility class — no instantiation
+    /** Convenience alias for NONE (used as the "no ASM" sentinel). */
+    public static final AsmStageCode NONE_ENUM = NONE;
 
     /**
-     * Encodes ASM type + stage text into a canonical integer code.
+     * Encodes ASM type + stage text into the canonical enum constant.
      *
-     * @param type  e.g. "STASM", "LTASM", "GSM", "ASM"
+     * @param type  e.g. "STASM", "LTASM", "GSM", "ASM", "shortterm", "longterm"
      * @param stage e.g. "I", "II", "III", "1", "2", "3", ""
-     * @return one of the constants above; 0 if unrecognised
      */
-    public static int encode(String type, String stage) {
-        int n = stageNum(stage);
+    public static AsmStageCode encode(String type, String stage) {
+        int n  = stageNum(stage);
         String t = type == null ? "" : type.trim().toUpperCase();
-        if (t.contains("LTASM") || t.contains("LONG"))  return ltasmCode(n);
-        if (t.contains("STASM") || t.contains("SHORT")) return stasmCode(n);
+        if (t.contains("LTASM") || t.contains("LONG"))  return ltasm(n);
+        if (t.contains("STASM") || t.contains("SHORT")) return stasm(n);
         if (t.contains("GSM"))                          return GSM;
-        if (t.contains("ASM"))                          return stasmCode(n);
+        if (t.contains("ASM"))                          return stasm(n);
         return NONE;
     }
 
-    /** Human-readable label for a stage code (useful for Pine labels). */
-    public static String label(int code) {
-        return switch (code) {
+    /** Returns true when this code represents any active surveillance. */
+    public boolean isActive() { return this != NONE; }
+
+    /** Human-readable label for Pine labels / logs. */
+    public String label() {
+        return switch (this) {
             case STASM_I   -> "STASM-I";
             case STASM_II  -> "STASM-II";
             case STASM_III -> "STASM-III";
@@ -68,25 +73,20 @@ public final class AsmStageCode {
         };
     }
 
-    private static int stasmCode(int n) {
-        return switch (n) {
-            case 2  -> STASM_II;
-            case 3  -> STASM_III;
-            default -> STASM_I;
-        };
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    private static AsmStageCode stasm(int n) {
+        return switch (n) { case 2 -> STASM_II; case 3 -> STASM_III; default -> STASM_I; };
     }
 
-    private static int ltasmCode(int n) {
-        return switch (n) {
-            case 2  -> LTASM_II;
-            case 3  -> LTASM_III;
-            default -> LTASM_I;
-        };
+    private static AsmStageCode ltasm(int n) {
+        return switch (n) { case 2 -> LTASM_II; case 3 -> LTASM_III; default -> LTASM_I; };
     }
 
     private static int stageNum(String stage) {
         if (stage == null) return 1;
         String u = stage.trim().toUpperCase();
+        if (u.contains("IV") || u.equals("4")) return 4;  // future-proof
         if (u.contains("III") || u.equals("3")) return 3;
         if (u.contains("II")  || u.equals("2")) return 2;
         return 1;

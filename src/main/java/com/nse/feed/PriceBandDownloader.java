@@ -14,17 +14,17 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * Downloads and parses the NSE FULL daily price band master file.
+ * Downloads and parses NSE full price-band master (sec_list_{ddmmyyyy}.csv).
  *
- * Source  : https://nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv
- * Used for: cold-start / Monday / --force-full runs only
+ * <p>Source: nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv
  *
- * Actual sec_list CSV columns (verified from live file):
- *   SYMBOL, NAME_OF_COMPANY, SERIES, DATE_OF_LISTING, PAID_UP_VALUE,
- *   MARKET_LOT, ISIN_NUMBER, FACE_VALUE, PRICE_BAND
+ * <h3>Verified columns from live file</h3>
+ * SYMBOL, NAME_OF_COMPANY, SERIES, DATE_OF_LISTING, PAID_UP_VALUE,
+ * MARKET_LOT, ISIN_NUMBER, FACE_VALUE, PRICE_BAND
  *
- * PRICE_BAND values: "2%", "5%", "10%", "20%", "No Band", "NA"
- * Returns EMPTY list (not exception) on 404 / non-trading day.
+ * <p>PRICE_BAND raw values: "2%", "5%", "10%", "20%", "No Band", "NA"
+ * The raw string is normalised and preserved as bandLabel so Pine displays
+ * exactly what NSE publishes.
  */
 public class PriceBandDownloader {
 
@@ -36,27 +36,21 @@ public class PriceBandDownloader {
         this.client = client;
     }
 
-    /**
-     * Downloads full sec_list CSV.
-     * NseClient.downloadSecList() tries up to 7 trading days backwards.
-     *
-     * @return list of PriceBandRecords; EMPTY list if not a trading day
-     */
-    public List<PriceBandRecord> downloadFull(LocalDate date) throws IOException {
-        log.info("[PriceBand] Starting FULL download (sec_list) for: {}", date);
-        String csv = client.downloadSecList(date);
+    // ── Public API ────────────────────────────────────────────────────────────
 
+    public List<PriceBandRecord> downloadFull(LocalDate date) throws IOException {
+        log.info("[PriceBand] FULL download (sec_list) for: {}", date);
+        String csv = client.downloadSecList(date);
         if (csv == null) {
-            log.warn("[PriceBand] sec_list not available for {} (non-trading day / holiday).", date);
+            log.warn("[PriceBand] sec_list not available — holiday / non-trading day.");
             return Collections.emptyList();
         }
-
         List<PriceBandRecord> records = parseSecListCsv(csv);
-        log.info("[PriceBand] FULL download complete: {} records.", records.size());
+        log.info("[PriceBand] FULL: {} records loaded.", records.size());
         return records;
     }
 
-    // ── CSV Parser — sec_list ─────────────────────────────────────────────────
+    // ── CSV Parser ────────────────────────────────────────────────────────────
 
     List<PriceBandRecord> parseSecListCsv(String csv) throws IOException {
         List<PriceBandRecord> records = new ArrayList<>();
@@ -64,24 +58,19 @@ public class PriceBandDownloader {
             String[] header = reader.readNext();
             if (header == null) return records;
 
-            // Column discovery — handles minor NSE header wording variations
             int idxSymbol = findCol(header, "SYMBOL", "SCRIP_CD", "SCRIP");
             int idxSeries = findCol(header, "SERIES");
             int idxBand   = findCol(header,
                     "PRICE_BAND", "PBAND", "BAND",
-                    "PRICE BAND", "PRICEBAND", "BAND_PERCENT",
-                    "BAND%", "PCT_BAND");
+                    "PRICE BAND", "PRICEBAND", "BAND_PERCENT", "BAND%", "PCT_BAND");
 
-            if (idxSymbol < 0) {
+            if (idxSymbol < 0)
                 throw new IOException(
-                    "[PriceBand] SYMBOL column not found in sec_list. Header: "
-                    + String.join(",", header));
-            }
-
-            if (idxBand < 0) {
+                        "[PriceBand] SYMBOL column not found. Header: "
+                        + String.join(",", header));
+            if (idxBand < 0)
                 log.warn("[PriceBand] PRICE_BAND column not found. Columns: {}",
                         String.join(",", header));
-            }
 
             String[] row;
             while ((row = reader.readNext()) != null) {
@@ -89,18 +78,52 @@ public class PriceBandDownloader {
                 try {
                     String symbol = clean(row[idxSymbol]);
                     if (symbol.isEmpty()) continue;
-                    String series   = idxSeries >= 0 ? clean(row[idxSeries]) : "EQ";
-                    double bandPct  = parseBandPct(row, idxBand);
-                    // sec_list has no absolute lower/upper prices — just band %
-                    records.add(new PriceBandRecord(symbol, series, 0.0, 0.0, 0.0, bandPct));
+                    String series    = idxSeries >= 0 ? clean(row[idxSeries]) : "EQ";
+                    String rawCell   = (idxBand >= 0 && idxBand < row.length)
+                                       ? row[idxBand].trim() : "";
+                    String bandLabel = normaliseBandLabel(rawCell);
+                    double bandPct   = parseBandPct(rawCell);
+                    records.add(new PriceBandRecord(
+                            symbol, series, 0.0, 0.0, 0.0, bandPct, bandLabel));
                 } catch (Exception e) {
-                    log.debug("[PriceBand] Skipping row: {}", String.join(",", row));
+                    log.debug("[PriceBand] Skipping malformed row: {}",
+                            String.join(",", row));
                 }
             }
         } catch (CsvValidationException e) {
             throw new IOException("[PriceBand] CSV parse error: " + e.getMessage(), e);
         }
         return records;
+    }
+
+    // ── Normalisation ─────────────────────────────────────────────────────────
+
+    /**
+     * Normalises the raw PRICE_BAND cell to a clean display string.
+     * <pre>
+     *   "20"      → "20%"
+     *   "20%"     → "20%"
+     *   "No Band" → "No Band"
+     *   ""        → "No Band"
+     *   "NA"      → "No Band"
+     * </pre>
+     */
+    static String normaliseBandLabel(String raw) {
+        if (raw == null || raw.isBlank()) return "No Band";
+        String t = raw.trim();
+        if (t.equalsIgnoreCase("NA")
+                || t.equals("-")
+                || t.equalsIgnoreCase("NO BAND")
+                || t.equalsIgnoreCase("NONE")
+                || t.equals("0")) return "No Band";
+        if (t.endsWith("%")) return t;          // already has suffix
+        try {
+            double v = Double.parseDouble(t.replace(",", ""));
+            if (v <= 0) return "No Band";
+            return (v == Math.floor(v)) ? (int) v + "%" : v + "%";
+        } catch (NumberFormatException e) {
+            return t;   // unknown string — return as-is
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -114,12 +137,9 @@ public class PriceBandDownloader {
 
     String clean(String s) { return s == null ? "" : s.trim().toUpperCase(); }
 
-    double parseBandPct(String[] row, int idx) {
-        if (idx < 0 || idx >= row.length) return 0.0;
-        String val = row[idx].trim()
-                .replace("%", "")
-                .replace(",", "")
-                .trim();
+    double parseBandPct(String raw) {
+        if (raw == null) return 0.0;
+        String val = raw.trim().replace("%", "").replace(",", "").trim();
         if (val.isEmpty() || val.equalsIgnoreCase("-")
                 || val.equalsIgnoreCase("NA")
                 || val.equalsIgnoreCase("NO BAND")
