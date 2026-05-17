@@ -1,96 +1,165 @@
-# NSE → TradingView Feed
+# nse-tradingview-feed
 
-A Java batch ETL that:
-1. Downloads **Daily Price Band** and **ASM / LTASM / STASM** CSVs from NSE India EOD.
-2. Merges and formats them into per-symbol daily OHLCV-like seed files.
-3. Commits the output to the `data/` folder so TradingView's `request.seed()` can consume them.
+Java ETL that pulls NSE daily price band and ASM/LTASM data, formats it for
+TradingView `request.seed()`, and auto-publishes via GitHub Actions.
 
 ---
 
-## Project Structure
+## Architecture
 
 ```
-nse-tradingview-feed/
-├── src/main/java/com/nse/feed/
-│   ├── Main.java                  # Entry point
-│   ├── NseClient.java             # HTTP client with NSE cookie/header handling
-│   ├── PriceBandDownloader.java   # Downloads & parses price band CSV
-│   ├── AsmDownloader.java         # Downloads & parses ASM/LTASM/STASM CSV
-│   ├── DataMerger.java            # Joins both datasets by symbol
-│   ├── SeedWriter.java            # Writes per-symbol CSV in TradingView seed format
-│   └── model/
-│       ├── PriceBandRecord.java
-│       ├── AsmRecord.java
-│       └── MergedRecord.java
-├── data/                          # Auto-generated output (committed by Actions)
-│   └── <SYMBOL>.csv               # One file per NSE symbol
-├── pom.xml
-└── .github/workflows/nse-etl.yml  # Daily GitHub Actions workflow
+┌─────────────────────────────────────────────────────────────────┐
+│                    GitHub Actions (daily cron)                   │
+│                          ↓                                      │
+│                       Main.java                                 │
+│                          │                                      │
+│          ┌───────────────┴──────────────┐                       │
+│          │                              │                       │
+│   COLD-START mode               DELTA mode                      │
+│   (first run / Monday           (every other trading day)       │
+│    / --force-full)                                              │
+│          │                              │                       │
+│  PriceBandDownloader          DeltaBandUpdater                  │
+│  circuit_DDMMYYYY.csv    eq_band_changes_DDMMYYYY.csv           │
+│  (~2000 rows, ALL EQ)    (~10-50 rows, CHANGED only)            │
+│          │                              │                       │
+│          └──────────┬───────────────────┘                       │
+│                     │                                           │
+│              AsmDownloader (always full refresh)                │
+│              asm_DDMMYYYY.csv (~100-300 rows)                   │
+│                     │                                           │
+│                  DataMerger                                     │
+│           mergeFull() / mergeDelta()                            │
+│                     │                                           │
+│                  SeedWriter                                     │
+│              data/<SYMBOL>.csv                                  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## How it works
+## Run Modes
 
-### NSE Data Sources
-| Data | NSE URL | Frequency |
-|------|---------|-----------|
-| Daily Price Bands | `https://nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O` + band report | EOD |
-| ASM / LTASM / STASM | `https://nseindia.com/reports/asm` (CSV download) | EOD |
+### Cold-Start (Full Extract)
 
-### TradingView Seed Format
-Each `data/<SYMBOL>.csv` follows TradingView's `request.seed` column layout:
+Triggered automatically when **any** of the following is true:
+
+| Condition | Reason |
+|---|---|
+| `data/cold_start.done` sentinel missing | First-ever run on fresh checkout |
+| Today is **Monday** | Weekly re-baseline to prevent drift |
+| `--force-full` CLI flag passed | Manual override |
+
+Downloads `circuit_DDMMYYYY.csv` — the full NSE price band file containing
+**all ~2000 EQ symbols** with their current band %. After a successful
+cold-start the sentinel file `data/cold_start.done` is written and committed
+so that the next daily run knows the baseline exists.
+
+### Delta (Incremental Daily)
+
+Every other trading day (Tue–Fri, no forced flag):
+
+Downloads `eq_band_changes_DDMMYYYY.csv` — **only symbols whose price band
+changed today** (~10–50 rows). Only those symbols' seed files are updated;
+all others are untouched. This makes the daily run extremely fast.
+
+---
+
+## NSE API Endpoints (Verified May 2026)
+
+All downloads use the NSE reports API:
+```
+GET https://www.nseindia.com/api/reports
+    ?archives=<url-encoded-json>
+    &date=DD-MMM-YYYY
+    &type=daily
+    &mode=single
+```
+
+| File | archives name | When used |
+|---|---|---|
+| `circuit_DDMMYYYY.csv` | Security Wise Daily Price Band | Cold-start |
+| `eq_band_changes_DDMMYYYY.csv` | Equity Band Change | Daily delta |
+| `asm_DDMMYYYY.csv` | Additional Surveillance Measure (ASM) | Every run |
+
+**Session warm-up (mandatory before any download):**
+```
+1. GET https://www.nseindia.com
+2. GET https://www.nseindia.com/market-data/securities-available-for-trading
+   (1.5s pause between each)
+```
+Without the two-step warm-up NSE returns 401 or an empty response.
+
+---
+
+## TradingView Seed Format
+
+Each symbol gets a file `data/<SYMBOL>.csv` appended with one row per trading day:
+
 ```
 date,open,high,low,close,volume
-2025-01-01,10,1250.5,1100.2,0,1
+2026-05-16,0.00,0.00,0.00,5.00,0
+2026-05-17,0.00,0.00,0.00,10.00,13
 ```
-Field mapping:
-| TV Field | Our Data |
-|----------|----------|
-| `close`  | Band % (e.g. 5, 10, 20; 0 = no static band / F&O) |
-| `high`   | Upper circuit price level |
-| `low`    | Lower circuit price level |
-| `open`   | Previous close |
-| `volume` | ASM stage code (0=none, 11=STASM-I, 12=STASM-II, 13=LTASM-I, 14=LTASM-II, 15=LTASM-III) |
 
-### Pine Script Usage
-```pine
-//@version=6
-indicator("NSE Band + ASM", overlay=true)
+| Column | Contains | Example |
+|---|---|---|
+| `date` | Trade date | 2026-05-17 |
+| `open` | Previous close (0 if from delta/circuit) | 245.30 |
+| `high` | Upper circuit level (0 if no static band) | 0 |
+| `low` | Lower circuit level (0 if no static band) | 0 |
+| `close` | Band % (5 / 10 / 20 / 0 = no band) | 5 |
+| `volume` | ASM stage code (see below) | 13 |
 
-[bc, bh, bl, bo, bv] = request.seed("rhariram11/nse-tradingview-feed", syminfo.ticker, [close, high, low, open, volume])
+**ASM stage codes:**
 
-bandPct  = bc   // circuit band %
-upper    = bh   // upper circuit level
-lower    = bl   // lower circuit level
-asmStage = bv   // ASM code
-
-// Display
-plot(upper, "Upper Circuit", color.red,   2, plot.style_circles)
-plot(lower, "Lower Circuit", color.green, 2, plot.style_circles)
-```
+| Code | Meaning |
+|---|---|
+| 0 | Not under surveillance |
+| 11 | STASM Stage I |
+| 12 | STASM Stage II |
+| 13 | LTASM Stage I |
+| 14 | LTASM Stage II |
+| 15 | LTASM Stage III |
+| 20 | GSM |
 
 ---
 
-## Running Locally
-
-### Prerequisites
-- Java 17+
-- Maven 3.8+
+## Building & Running
 
 ```bash
-mvn clean package
-java -jar target/nse-feed-1.0.0.jar
-```
+# Build
+mvn clean package -q
 
-Output CSVs will be written to `data/`.
+# Run (delta mode — normal daily)
+java -jar target/nse-tradingview-feed.jar
+
+# Run cold-start manually
+java -jar target/nse-tradingview-feed.jar --force-full
+
+# Override trade date (e.g. backfill a missed day)
+java -jar target/nse-tradingview-feed.jar --date 2026-05-16
+
+# Force full extract for a specific date
+java -jar target/nse-tradingview-feed.jar --force-full --date 2026-05-16
+```
 
 ---
 
 ## GitHub Actions
-The workflow `.github/workflows/nse-etl.yml` runs **Monday–Saturday at 4:30 PM IST (11:00 UTC)** to capture EOD data after markets close at 3:30 PM IST.
 
-The workflow:
-1. Builds the JAR.
-2. Runs the ETL.
-3. Commits any changed `data/*.csv` files back to `main`.
+The workflow runs daily at **04:30 IST (23:00 UTC)** — after NSE publishes
+end-of-day files. Monday runs automatically use cold-start mode.
+
+---
+
+## Sentinel File
+
+`data/cold_start.done` — created after every successful cold-start run.
+Contents:
+```
+Last full extract: 2026-05-12
+Next full extract: next Monday or --force-full
+```
+This file is committed by GitHub Actions so subsequent runs on the same
+runner (or a fresh checkout) know whether a baseline already exists.

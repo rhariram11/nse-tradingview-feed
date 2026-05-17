@@ -9,34 +9,31 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.StringReader;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Downloads and parses the NSE Daily Price Band report.
+ * Downloads and parses the NSE FULL daily price band circuit file.
  *
- * NSE publishes a CSV daily at:
- *   https://nseindia.com/api/equity-market?type=daily_price_bands
+ * Source file  : circuit_DDMMYYYY.csv
+ * NSE endpoint : /api/reports?archives=[{"name":"Security Wise Daily Price Band",...}]&date=DD-MMM-YYYY
  *
- * Typical CSV columns (NSE format, may vary slightly):
- *   SYMBOL, SERIES, PREV_CLOSE, LOWER_BAND, UPPER_BAND, BAND_PERCENT
+ * This class is used ONLY for:
+ *   - Cold-start (first ever run, no seed data present)
+ *   - Monday refresh (full re-baseline every week)
+ *   - Manual --force-full flag
  *
- * Symbols on the F&O segment have NO static band (dynamic ±10% intraday).
- * The parser sets bandPercent=0 for those.
+ * For normal daily updates use DeltaBandUpdater which downloads only the
+ * much smaller eq_band_changes_DDMMYYYY.csv (~10-50 rows vs ~2000 rows).
+ *
+ * CSV columns (NSE format):
+ *   SYMBOL, SERIES, LOWER_BAND, UPPER_BAND, PBAND (band %)
+ *   Note: NSE circuit file does NOT carry PREV_CLOSE — that is 0.0 here.
+ *         PREV_CLOSE is available in Bhavcopy if needed in future.
  */
 public class PriceBandDownloader {
 
     private static final Logger log = LoggerFactory.getLogger(PriceBandDownloader.class);
-
-    // Primary endpoint for daily security-wise price band
-    private static final String PRICE_BAND_API =
-            "https://www.nseindia.com/api/equity-market?type=daily_price_bands";
-
-    // Fallback: the bhavcopy-style CSV (security-wise) which also carries band info
-    private static final String BHAVCOPY_API =
-            "https://www.nseindia.com/api/reports?archives=%5B%7B%22name%22%3A%22Security+Wise+Daily+Price+Band%22%2C%22type%22%3A%22daily%22%2C%22category%22%3A%22capital_market%22%2C%22section%22%3A%22equity%22%7D%5D&date=" +
-            LocalDate.now().format(DateTimeFormatter.ofPattern("dd-MM-yyyy")) + "&type=daily&mode=single";
 
     private final NseClient client;
 
@@ -44,63 +41,75 @@ public class PriceBandDownloader {
         this.client = client;
     }
 
-    public List<PriceBandRecord> download() throws IOException {
-        log.info("Downloading Daily Price Band data...");
-        byte[] raw;
-        try {
-            raw = client.get(PRICE_BAND_API);
-        } catch (IOException e) {
-            log.warn("Primary price band API failed ({}), trying bhavcopy fallback...", e.getMessage());
-            raw = client.get(BHAVCOPY_API);
+    /**
+     * Downloads the full circuit CSV for the given trade date and parses it.
+     * Returns all ~2000 EQ symbols with their current price band %.
+     *
+     * @param date trade date (use today, or last trading day if today is holiday/weekend)
+     */
+    public List<PriceBandRecord> downloadFull(LocalDate date) throws IOException {
+        log.info("[PriceBand] Starting FULL download for date: {}", date);
+        byte[] raw = client.downloadFullBandCsv(date);
+        String csv = new String(raw, java.nio.charset.StandardCharsets.UTF_8).trim();
+
+        if (csv.isEmpty() || csv.startsWith("<")) {
+            // NSE sometimes returns HTML error page on non-trading days
+            throw new IOException(
+                "[PriceBand] Full circuit file empty or HTML for date: " + date
+                + ". Is this a trading day?");
         }
-        return parseCsv(new String(raw));
+
+        List<PriceBandRecord> records = parseCsv(csv);
+        log.info("[PriceBand] FULL download complete: {} records for {}", records.size(), date);
+        return records;
     }
 
-    private List<PriceBandRecord> parseCsv(String csv) throws IOException {
+    // ── CSV Parser ───────────────────────────────────────────────────────────
+
+    List<PriceBandRecord> parseCsv(String csv) throws IOException {
         List<PriceBandRecord> records = new ArrayList<>();
         try (CSVReader reader = new CSVReader(new StringReader(csv))) {
-            String[] header = reader.readNext(); // skip / map header
+            String[] header = reader.readNext();
             if (header == null) return records;
 
-            // Detect column indices flexibly
-            int idxSymbol    = findCol(header, "SYMBOL");
-            int idxSeries    = findCol(header, "SERIES");
-            int idxPrevClose = findCol(header, "PREV_CLOSE", "PREVCLOSE", "PREV CLOSE");
-            int idxLower     = findCol(header, "LOWER_BAND", "LOWERBAND", "LOWER BAND", "LB");
-            int idxUpper     = findCol(header, "UPPER_BAND", "UPPERBAND", "UPPER BAND", "UB");
-            int idxPct       = findCol(header, "BAND_PERCENT", "BANDPCT", "BAND%", "PBAND");
+            // Flexible column detection — NSE occasionally renames columns
+            int idxSymbol = findCol(header, "SYMBOL", "SCRIP_CD");
+            int idxSeries = findCol(header, "SERIES");
+            int idxLower  = findCol(header, "LOWER_BAND", "LOWERBAND", "LOWER BAND", "LB", "LOWER");
+            int idxUpper  = findCol(header, "UPPER_BAND", "UPPERBAND", "UPPER BAND", "UB", "UPPER");
+            int idxPct    = findCol(header, "PBAND", "BAND_PERCENT", "BANDPCT", "BAND%",
+                                           "PRICE BAND", "PRICEBAND", "PCT_BAND");
+
+            if (idxSymbol < 0) {
+                throw new IOException("[PriceBand] Cannot find SYMBOL column in header: "
+                        + String.join(",", header));
+            }
 
             String[] row;
             while ((row = reader.readNext()) != null) {
                 if (row.length < 2) continue;
                 try {
-                    String symbol    = clean(row[idxSymbol]);
-                    String series    = idxSeries >= 0 ? clean(row[idxSeries]) : "EQ";
-                    double prevClose = parseDouble(row, idxPrevClose);
-                    double lower     = parseDouble(row, idxLower);
-                    double upper     = parseDouble(row, idxUpper);
-                    double bandPct   = parseDouble(row, idxPct);
-
-                    // 0 band = no static circuit (F&O stocks)
-                    if (bandPct == 0 && lower == 0 && upper == 0) {
-                        bandPct = 0; // explicitly no static band
-                    }
-
-                    records.add(new PriceBandRecord(symbol, series, prevClose, lower, upper, bandPct));
+                    String symbol  = clean(row[idxSymbol]);
+                    if (symbol.isEmpty()) continue;
+                    String series  = idxSeries >= 0 ? clean(row[idxSeries]) : "EQ";
+                    double lower   = parseDouble(row, idxLower);
+                    double upper   = parseDouble(row, idxUpper);
+                    double bandPct = parseDouble(row, idxPct);
+                    // prevClose = 0.0 (not in circuit file; available in Bhavcopy)
+                    records.add(new PriceBandRecord(symbol, series, 0.0, lower, upper, bandPct));
                 } catch (Exception e) {
-                    log.debug("Skipping malformed row: {}", String.join(",", row));
+                    log.debug("[PriceBand] Skipping malformed row: {}", String.join(",", row));
                 }
             }
         } catch (CsvValidationException e) {
-            throw new IOException("CSV parse error: " + e.getMessage(), e);
+            throw new IOException("[PriceBand] CSV parse error: " + e.getMessage(), e);
         }
-        log.info("Parsed {} price band records.", records.size());
         return records;
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────────
+    // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private int findCol(String[] header, String... names) {
+    int findCol(String[] header, String... names) {
         for (String name : names) {
             for (int i = 0; i < header.length; i++) {
                 if (header[i].trim().equalsIgnoreCase(name)) return i;
@@ -109,14 +118,15 @@ public class PriceBandDownloader {
         return -1;
     }
 
-    private String clean(String s) {
+    String clean(String s) {
         return s == null ? "" : s.trim().toUpperCase();
     }
 
-    private double parseDouble(String[] row, int idx) {
+    double parseDouble(String[] row, int idx) {
         if (idx < 0 || idx >= row.length) return 0.0;
         String val = row[idx].trim().replace(",", "");
-        if (val.isEmpty() || val.equals("-")) return 0.0;
-        try { return Double.parseDouble(val); } catch (NumberFormatException e) { return 0.0; }
+        if (val.isEmpty() || val.equals("-") || val.equalsIgnoreCase("NA")) return 0.0;
+        try { return Double.parseDouble(val); }
+        catch (NumberFormatException e) { return 0.0; }
     }
 }
