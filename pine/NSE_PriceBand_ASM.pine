@@ -1,0 +1,166 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0
+// © rhariram11
+//@version=6
+indicator("NSE Price Band & ASM", overlay = false, max_labels_count = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NSE Price Band & ASM Indicator
+//
+//  Reads seed data from GitHub: rhariram11/nse-tradingview-feed
+//
+//  Seed CSV  data/{SYMBOL}.csv  column mapping:
+//    date   = trade date
+//    open   = previous close
+//    high   = upper circuit price   (0 = no static band / F&O)
+//    low    = lower circuit price   (0 = no static band / F&O)
+//    close  = band %  (5 / 10 / 20 / 0)
+//    volume = ASM stage code
+//               0  = none
+//              11  = STASM-I    12 = STASM-II    13 = STASM-III
+//              21  = LTASM-I    22 = LTASM-II    23 = LTASM-III
+//              30  = GSM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Inputs ────────────────────────────────────────────────────────────────
+var GRP_REPO = "Seed Data (GitHub)"
+var GRP_DISP = "Display"
+var GRP_COL  = "Colours"
+
+repoPath = input.string(
+    defval  = "rhariram11/nse-tradingview-feed",
+    title   = "Repo (owner/repo)",
+    group   = GRP_REPO)
+
+showBandPct  = input.bool(true, "Band % panel",       group = GRP_DISP)
+showAsmPanel = input.bool(true, "ASM code panel",     group = GRP_DISP)
+showBgColor  = input.bool(true, "BG colour by ASM",   group = GRP_DISP)
+showLabel    = input.bool(true, "ASM label on bar",   group = GRP_DISP)
+showAlerts   = input.bool(true, "Alert conditions",   group = GRP_DISP)
+
+colBand5  = input.color(color.new(color.teal,   60), "Band 5%",   group = GRP_COL)
+colBand10 = input.color(color.new(color.blue,   60), "Band 10%",  group = GRP_COL)
+colBand20 = input.color(color.new(color.orange, 60), "Band 20%",  group = GRP_COL)
+colSTASM  = input.color(color.new(color.yellow, 50), "STASM bg",  group = GRP_COL)
+colLTASM  = input.color(color.new(color.red,    50), "LTASM bg",  group = GRP_COL)
+colGSM    = input.color(color.new(color.fuchsia,50), "GSM bg",    group = GRP_COL)
+
+// ── Seed data ─────────────────────────────────────────────────────────────
+bandPctRaw = request.seed(repoPath, syminfo.ticker, close)   // close  = band %
+asmCodeRaw = request.seed(repoPath, syminfo.ticker, volume)  // volume = ASM code
+
+bandPct = na(bandPctRaw) ? 0.0 : bandPctRaw
+asmCode = na(asmCodeRaw) ? 0   : int(asmCodeRaw)
+hasSeedData = not na(bandPctRaw) or not na(asmCodeRaw)
+
+// ── ASM decode ────────────────────────────────────────────────────────────
+int STASM_I=11, STASM_II=12, STASM_III=13
+int LTASM_I=21, LTASM_II=22, LTASM_III=23
+int GSM=30
+
+bool isSTASM  = asmCode >= STASM_I  and asmCode <= STASM_III
+bool isLTASM  = asmCode >= LTASM_I  and asmCode <= LTASM_III
+bool isGSM    = asmCode == GSM
+bool isAnyAsm = isSTASM or isLTASM or isGSM
+
+asmLabel = switch asmCode
+    STASM_I   => "STASM-I"
+    STASM_II  => "STASM-II"
+    STASM_III => "STASM-III"
+    LTASM_I   => "LTASM-I"
+    LTASM_II  => "LTASM-II"
+    LTASM_III => "LTASM-III"
+    GSM       => "GSM"
+    =>            ""
+
+// ── Band % panel ──────────────────────────────────────────────────────────
+bandColor = bandPct == 5  ? colBand5  :
+            bandPct == 10 ? colBand10 :
+            bandPct == 20 ? colBand20 :
+            color.new(color.gray, 80)
+
+plot(showBandPct ? bandPct : na,
+    title     = "Band %",
+    color     = bandColor,
+    style     = plot.style_columns,
+    linewidth = 1)
+
+// ── ASM code panel ────────────────────────────────────────────────────────
+plot(showAsmPanel ? asmCode : na,
+    title     = "ASM Code",
+    color     = isGSM   ? colGSM   :
+                isLTASM ? colLTASM :
+                isSTASM ? colSTASM :
+                color.new(color.gray, 80),
+    style     = plot.style_histogram,
+    linewidth = 2)
+
+// ── Background colour by ASM ───────────────────────────────────────────────
+bgcolor(showBgColor and isGSM   ? colGSM   : na, title = "GSM bg")
+bgcolor(showBgColor and isLTASM ? colLTASM : na, title = "LTASM bg")
+bgcolor(showBgColor and isSTASM ? colSTASM : na, title = "STASM bg")
+
+// ── ASM label ─────────────────────────────────────────────────────────────
+if showLabel and isAnyAsm and barstate.isconfirmed
+    label.new(
+        x         = bar_index,
+        y         = asmCode,
+        text      = asmLabel,
+        style     = label.style_label_up,
+        color     = isGSM ? colGSM : isLTASM ? colLTASM : colSTASM,
+        textcolor = color.white,
+        size      = size.tiny)
+
+// ── No-data warning ───────────────────────────────────────────────────────
+if barstate.islast and not hasSeedData
+    label.new(
+        x         = bar_index,
+        y         = 0,
+        text      = "⚠ No seed data for " + syminfo.ticker,
+        style     = label.style_label_up,
+        color     = color.new(color.red, 20),
+        textcolor = color.white,
+        size      = size.normal)
+
+// ── Reference lines ───────────────────────────────────────────────────────
+hline(5,  "5% band",  color=color.new(color.teal,  70), linestyle=hline.style_dotted)
+hline(10, "10% band", color=color.new(color.blue,  70), linestyle=hline.style_dotted)
+hline(20, "20% band", color=color.new(color.orange,70), linestyle=hline.style_dotted)
+
+// ── Status table (top-right) ──────────────────────────────────────────────
+var table t = table.new(position.top_right, 2, 5,
+    bgcolor=color.new(color.black,60),
+    border_color=color.new(color.gray,60), border_width=1)
+
+if barstate.islast
+    table.cell(t,0,0,"Symbol",      text_color=color.gray,  text_size=size.small)
+    table.cell(t,1,0,syminfo.ticker,text_color=color.white, text_size=size.small)
+    table.cell(t,0,1,"Band %",      text_color=color.gray,  text_size=size.small)
+    table.cell(t,1,1,
+        bandPct==0 ? "No Band/F&O" : str.tostring(bandPct)+"%",
+        text_color=bandPct>0 ? bandColor : color.gray, text_size=size.small)
+    table.cell(t,0,2,"ASM",         text_color=color.gray,  text_size=size.small)
+    table.cell(t,1,2,
+        asmLabel=="" ? "None" : asmLabel,
+        text_color=isGSM?colGSM:isLTASM?colLTASM:isSTASM?colSTASM:color.gray,
+        text_size=size.small)
+    table.cell(t,0,3,"ASM Code",    text_color=color.gray,  text_size=size.small)
+    table.cell(t,1,3,str.tostring(asmCode),
+        text_color=isAnyAsm?color.orange:color.gray, text_size=size.small)
+    table.cell(t,0,4,"Data",        text_color=color.gray,  text_size=size.small)
+    table.cell(t,1,4,
+        hasSeedData?"✓ OK":"✗ Missing",
+        text_color=hasSeedData?color.green:color.red, text_size=size.small)
+
+// ── Alerts ────────────────────────────────────────────────────────────────
+alertcondition(showAlerts and ta.change(asmCode)!=0 and asmCode>0,
+    title="ASM Status Changed",
+    message="{{ticker}} ASM → {{plot_2}}")
+alertcondition(showAlerts and isAnyAsm and not isAnyAsm[1],
+    title="Entered ASM",
+    message="{{ticker}} entered ASM surveillance")
+alertcondition(showAlerts and not isAnyAsm and isAnyAsm[1],
+    title="Exited ASM",
+    message="{{ticker}} removed from ASM surveillance")
+alertcondition(showAlerts and ta.change(bandPct)!=0 and bandPct>0,
+    title="Band % Changed",
+    message="{{ticker}} circuit band → {{plot_1}}%")

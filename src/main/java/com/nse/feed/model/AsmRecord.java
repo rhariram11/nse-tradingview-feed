@@ -1,14 +1,13 @@
 package com.nse.feed.model;
 
 /**
- * Immutable record representing one row from the NSE ASM / LTASM / STASM surveillance report.
+ * Immutable record representing one NSE ASM / STASM / LTASM / GSM entry.
  *
- * @param symbol    NSE ticker symbol
- * @param isin      ISIN code
- * @param type      Surveillance type text (STASM / LTASM / GSM / ASM)
- * @param stage     Raw stage text from NSE (e.g. "I", "II", "III")
- * @param stageCode Encoded integer: 0=none, 11=STASM-I, 12=STASM-II,
- *                  13=LTASM-I, 14=LTASM-II, 15=LTASM-III, 20=GSM
+ * @param symbol    NSE ticker
+ * @param isin      ISIN (may be empty string when derived from REMARKS)
+ * @param type      Canonical type: "STASM" | "LTASM" | "GSM" | "ASM"
+ * @param stage     Raw stage text from NSE: "I" | "II" | "III"
+ * @param stageCode Encoded integer — see {@link AsmStageCode} for all constants
  */
 public record AsmRecord(
         String symbol,
@@ -16,4 +15,12 @@ public record AsmRecord(
         String type,
         String stage,
         int    stageCode
-) {}
+) {
+    /** Convenience factory — encodes stageCode from type+stage automatically. */
+    public static AsmRecord of(String symbol, String isin, String type, String stage) {
+        return new AsmRecord(symbol, isin, type, stage, AsmStageCode.encode(type, stage));
+    }
+
+    /** Label suitable for Pine Script / UI display. */
+    public String label() { return AsmStageCode.label(stageCode); }
+}

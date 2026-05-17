@@ -1,38 +1,48 @@
 package com.nse.feed;
 
 import com.nse.feed.model.AsmRecord;
-import com.opencsv.CSVReader;
-import com.opencsv.exceptions.CsvValidationException;
+import com.nse.feed.model.AsmStageCode;
+import com.nse.feed.model.PriceBandRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.StringReader;
-import java.time.LocalDate;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Downloads and parses the NSE ASM / STASM / LTASM surveillance list.
+ * Downloads and parses the NSE ASM surveillance list.
  *
- * ── Strategy ──────────────────────────────────────────────────────────────────
+ * <h3>Strategy (ordered by reliability)</h3>
+ * <ol>
+ *   <li><b>Session JSON API</b> — {@code /api/asm-securities?asmType=shortterm|longterm}
+ *       Parsed with regex object extraction — no external JSON lib dependency.</li>
+ *   <li><b>REMARKS fallback</b> — derives ASM flags from the REMARKS column of
+ *       eq_band_changes. Only covers stocks whose band changed that day.</li>
+ * </ol>
  *
- * PRIMARY  : Session-based JSON API
- *   GET /api/asm-securities?asmType=shortterm   → STASM list
- *   GET /api/asm-securities?asmType=longterm    → LTASM list
- *   Requires warmUpSession() in NseClient before calling.
- *
- * FALLBACK : Derive from eq_band_changes REMARKS column
- *   NSE includes strings like "ASM Stage 1", "LTASM Stage 2" in the REMARKS
- *   column of the delta band-change file. When the session API fails or
- *   returns empty data, Main calls deriveFromRemarks() to extract ASM symbols.
- *
- * Returns EMPTY map (not an exception) in all failure cases.
- * Main handles empty ASM map gracefully.
+ * <h3>Stage code encoding</h3>
+ * All codes delegate to {@link AsmStageCode} — the single source of truth.
+ * <pre>
+ *   STASM: 11 / 12 / 13
+ *   LTASM: 21 / 22 / 23  (non-overlapping range)
+ *   GSM  : 30
+ * </pre>
  */
 public class AsmDownloader {
 
     private static final Logger log = LoggerFactory.getLogger(AsmDownloader.class);
+
+    // Captures: "fieldName":"value" from a JSON object snippet
+    private static final Pattern FIELD_PAT =
+        Pattern.compile("\\\"([^\"]+)\\\"\\s*:\\s*\\\"([^\"]*)\\\"");
+
+    // Matches a single-level JSON object  { ... }
+    private static final Pattern OBJECT_PAT =
+        Pattern.compile("\\{[^{}]*\\}");
 
     private final NseClient client;
 
@@ -40,124 +50,143 @@ public class AsmDownloader {
         this.client = client;
     }
 
-    /**
-     * Attempts to download ASM list via session-based JSON API.
-     *
-     * @return symbol → AsmRecord map; EMPTY map on failure / non-trading day
-     */
-    public Map<String, AsmRecord> download(LocalDate date) throws IOException {
-        log.info("[ASM] Attempting session-based ASM download for: {}", date);
+    // ── Public API ────────────────────────────────────────────────────────────
 
-        String json = null;
+    /**
+     * Downloads both STASM and LTASM lists from the session API.
+     *
+     * @return symbol → AsmRecord; EMPTY (never null) on any failure
+     */
+    public Map<String, AsmRecord> download(java.time.LocalDate date) throws IOException {
+        log.info("[ASM] Session API download for: {}", date);
+
+        String json;
         try {
             json = client.downloadAsmJson();
         } catch (IOException e) {
-            log.warn("[ASM] Session API failed: {}. Will use REMARKS fallback.", e.getMessage());
-            return new HashMap<>();
+            log.warn("[ASM] Session API I/O failure: {}. Using empty map.", e.getMessage());
+            return Collections.emptyMap();
         }
 
         if (json == null || json.isBlank()) {
-            log.warn("[ASM] Session API returned empty. Will use REMARKS fallback.");
-            return new HashMap<>();
+            log.warn("[ASM] Session API returned empty. Using empty map.");
+            return Collections.emptyMap();
         }
 
-        Map<String, AsmRecord> result = parseAsmJson(json);
-        log.info("[ASM] Session API: {} ASM symbols parsed.", result.size());
-        return result;
+        Map<String, AsmRecord> result = new HashMap<>();
+        result.putAll(parseAsmHalf(json, "shortterm", "STASM"));
+        result.putAll(parseAsmHalf(json, "longterm",  "LTASM"));
+        if (result.isEmpty()) {
+            result.putAll(parseAsmObjectArray(json, "ASM"));
+        }
+
+        log.info("[ASM] Session API: {} ASM symbols.", result.size());
+        return Collections.unmodifiableMap(result);
     }
 
     /**
-     * Derives ASM-flagged symbols from the REMARKS column of eq_band_changes.
-     * NSE includes text like "ASM Stage 1", "STASM Stage I", "LTASM Stage II"
-     * in the REMARKS field when a stock enters or changes ASM stage.
-     *
-     * This is the reliable fallback when the session API is unavailable.
-     *
-     * @param deltaMap symbol → PriceBandRecord from DeltaBandUpdater
-     * @return symbol → AsmRecord derived from REMARKS text
+     * Derives ASM flags from REMARKS text in the eq_band_changes delta file.
+     * Only covers stocks whose band changed that day.
      */
     public Map<String, AsmRecord> deriveFromRemarks(
-            Map<String, com.nse.feed.model.PriceBandRecord> deltaMap) {
+            Map<String, PriceBandRecord> deltaMap) {
 
         Map<String, AsmRecord> result = new HashMap<>();
-        for (Map.Entry<String, com.nse.feed.model.PriceBandRecord> entry : deltaMap.entrySet()) {
+        for (Map.Entry<String, PriceBandRecord> entry : deltaMap.entrySet()) {
             String symbol  = entry.getKey();
             String remarks = entry.getValue().getRemarks();
-            if (remarks == null) continue;
+            if (remarks == null || !remarks.toUpperCase().contains("ASM")) continue;
             String upper = remarks.toUpperCase();
-            if (!upper.contains("ASM")) continue;
-
             String type  = deriveType(upper);
             String stage = deriveStage(upper);
-            int    code  = toStageCode(type, stage);
-            result.put(symbol, new AsmRecord(symbol, "", type, stage, code));
+            result.put(symbol, AsmRecord.of(symbol, "", type, stage));
             log.info("[ASM] Derived from REMARKS: {} → {} {}", symbol, type, stage);
         }
-        log.info("[ASM] REMARKS fallback: {} ASM symbols found.", result.size());
-        return result;
+        log.info("[ASM] REMARKS fallback: {} symbols.", result.size());
+        return Collections.unmodifiableMap(result);
     }
 
-    // ── JSON Parser ───────────────────────────────────────────────────────────
-    //
-    // NSE API returns one of:
-    //   a) { "data": [ { "symbol": "X", ... }, ... ] }
-    //   b) [ { "symbol": "X", ... }, ... ]
-    //   c) { "shortterm": {...}, "longterm": {...} }  ← combined wrapper from NseClient
-    //
-    // We use a simple substring scan (no external JSON lib needed for this).
+    // ── JSON Parsing ──────────────────────────────────────────────────────────
 
-    private Map<String, AsmRecord> parseAsmJson(String json) {
+    private Map<String, AsmRecord> parseAsmHalf(String json, String key, String defaultType) {
+        String keyToken = "\"" + key + "\"";
+        int keyIdx = json.indexOf(keyToken);
+        if (keyIdx < 0) return Collections.emptyMap();
+        int arrStart = json.indexOf('[', keyIdx);
+        if (arrStart < 0) return Collections.emptyMap();
+        int arrEnd = findMatchingBracket(json, arrStart, '[', ']');
+        if (arrEnd < 0) return Collections.emptyMap();
+        return parseAsmObjectArray(json.substring(arrStart, arrEnd + 1), defaultType);
+    }
+
+    private Map<String, AsmRecord> parseAsmObjectArray(String json, String defaultType) {
         Map<String, AsmRecord> map = new HashMap<>();
-        int idx = 0;
-        while (true) {
-            // Find "symbol" key
-            int keyIdx = json.indexOf("\"symbol\"", idx);
-            if (keyIdx < 0) break;
-            int colon  = json.indexOf(':', keyIdx);
-            int openQ  = json.indexOf('"', colon + 1);
-            int closeQ = json.indexOf('"', openQ + 1);
-            if (openQ < 0 || closeQ < 0) break;
-            String symbol = json.substring(openQ + 1, closeQ).trim().toUpperCase();
-            idx = closeQ + 1;
-            if (symbol.isEmpty()) continue;
-
-            // Look for asmType / stage near this symbol entry (within next 300 chars)
-            String nearby = json.substring(closeQ, Math.min(closeQ + 300, json.length()));
-            String type  = extractField(nearby, "asmType", "type");
-            String stage = extractField(nearby, "asmStage", "stage");
-            if (type.isEmpty())  type  = deriveType(nearby.toUpperCase());
-            if (stage.isEmpty()) stage = deriveStage(nearby.toUpperCase());
-            int code = toStageCode(type.toUpperCase(), stage.toUpperCase());
-            map.put(symbol, new AsmRecord(symbol, "", type, stage, code));
+        String payload = unwrapDataArray(json);
+        Matcher objM = OBJECT_PAT.matcher(payload);
+        while (objM.find()) {
+            String obj    = objM.group();
+            Map<String, String> fields = extractAllFields(obj);
+            String symbol = coalesce(fields, "symbol", "SYMBOL", "scrip", "SCRIP");
+            if (symbol == null || symbol.isBlank()) continue;
+            symbol = symbol.trim().toUpperCase();
+            String isin     = coalesce(fields, "isin", "ISIN");
+            String rawType  = coalesce(fields, "asmType", "asmtype", "type", "TYPE");
+            String rawStage = coalesce(fields, "asmStage", "asmstage", "stage", "STAGE");
+            if (rawType.isBlank())  rawType  = deriveType(obj.toUpperCase());
+            if (rawStage.isBlank()) rawStage = deriveStage(obj.toUpperCase());
+            if (rawType.isBlank())  rawType  = defaultType;
+            map.put(symbol, AsmRecord.of(symbol, isin == null ? "" : isin, rawType, rawStage));
         }
         return map;
     }
 
-    /** Extract value of first matching field name from a JSON snippet. */
-    private String extractField(String json, String... fieldNames) {
-        for (String field : fieldNames) {
-            String key = "\"" + field + "\"";
-            int ki = json.indexOf(key);
-            if (ki < 0) continue;
-            int colon  = json.indexOf(':', ki);
-            int openQ  = json.indexOf('"', colon + 1);
-            int closeQ = json.indexOf('"', openQ + 1);
-            if (openQ < 0 || closeQ < 0) continue;
-            return json.substring(openQ + 1, closeQ).trim();
+    private Map<String, String> extractAllFields(String obj) {
+        Map<String, String> fields = new HashMap<>();
+        Matcher m = FIELD_PAT.matcher(obj);
+        while (m.find()) fields.put(m.group(1), m.group(2));
+        return fields;
+    }
+
+    private String coalesce(Map<String, String> fields, String... keys) {
+        for (String k : keys) {
+            String v = fields.get(k);
+            if (v != null && !v.isBlank()) return v;
         }
         return "";
     }
 
-    // ── Stage / type derivation ───────────────────────────────────────────────
+    private String unwrapDataArray(String json) {
+        for (String key : new String[]{"data", "records", "Data", "Records"}) {
+            int ki = json.indexOf("\"" + key + "\"");
+            if (ki < 0) continue;
+            int arrStart = json.indexOf('[', ki);
+            if (arrStart < 0) continue;
+            int arrEnd = findMatchingBracket(json, arrStart, '[', ']');
+            if (arrEnd >= 0) return json.substring(arrStart, arrEnd + 1);
+        }
+        return json;
+    }
+
+    private int findMatchingBracket(String s, int start, char open, char close) {
+        int depth = 0;
+        for (int i = start; i < s.length(); i++) {
+            if (s.charAt(i) == open)  depth++;
+            if (s.charAt(i) == close) depth--;
+            if (depth == 0) return i;
+        }
+        return -1;
+    }
+
+    // ── Type / Stage derivation ───────────────────────────────────────────────
 
     static String deriveType(String upper) {
-        if (upper.contains("LTASM")) return "LTASM";
-        if (upper.contains("STASM")) return "STASM";
-        if (upper.contains("SHORTTERM") || upper.contains("SHORT")) return "STASM";
-        if (upper.contains("LONGTERM")  || upper.contains("LONG"))  return "LTASM";
-        if (upper.contains("GSM"))   return "GSM";
-        if (upper.contains("ASM"))   return "ASM";
-        return "ASM";
+        if (upper.contains("LTASM"))                                 return "LTASM";
+        if (upper.contains("STASM"))                                 return "STASM";
+        if (upper.contains("SHORTTERM") || upper.contains("SHORT TERM")) return "STASM";
+        if (upper.contains("LONGTERM")  || upper.contains("LONG TERM"))  return "LTASM";
+        if (upper.contains("GSM"))                                   return "GSM";
+        if (upper.contains("ASM"))                                   return "ASM";
+        return "";
     }
 
     static String deriveStage(String upper) {
@@ -165,69 +194,5 @@ public class AsmDownloader {
         if (upper.contains("II")  || upper.contains("STAGE 2") || upper.contains("STAGE2")) return "II";
         if (upper.contains("I")   || upper.contains("STAGE 1") || upper.contains("STAGE1")) return "I";
         return "I";
-    }
-
-    static int toStageCode(String type, String stage) {
-        int n = stageNum(stage);
-        if (type.contains("LTASM") || type.contains("LONG"))  return 12 + n;
-        if (type.contains("STASM") || type.contains("SHORT")) return 10 + n;
-        if (type.contains("GSM"))                             return 20;
-        if (type.contains("ASM"))                             return n > 0 ? (10 + n) : 11;
-        return 0;
-    }
-
-    private static int stageNum(String stage) {
-        String u = stage.trim().toUpperCase();
-        if (u.contains("III") || u.equals("3")) return 3;
-        if (u.contains("II")  || u.equals("2")) return 2;
-        return 1;
-    }
-
-    // ── Legacy CSV parser (kept for if NSE re-enables CSV ASM download) ───────
-
-    private Map<String, AsmRecord> parseCsv(String csv) throws IOException {
-        Map<String, AsmRecord> map = new HashMap<>();
-        try (CSVReader reader = new CSVReader(new StringReader(csv))) {
-            String[] header = reader.readNext();
-            if (header == null) return map;
-
-            int idxSymbol = findCol(header, "SYMBOL");
-            int idxIsin   = findCol(header, "ISIN");
-            int idxStage  = findCol(header,
-                    "ASM STAGE", "LTASM STAGE", "STASM STAGE", "STAGE",
-                    "ASMSTAGE", "ASM_STAGE", "SURVEILLANCE STAGE");
-            int idxType   = findCol(header,
-                    "ASM TYPE", "TYPE", "ASM_TYPE", "SURVEILLANCE TYPE", "SURV TYPE");
-
-            String[] row;
-            while ((row = reader.readNext()) != null) {
-                if (row.length < 2) continue;
-                try {
-                    String symbol = clean(row[idxSymbol]);
-                    if (symbol.isEmpty()) continue;
-                    String isin  = idxIsin  >= 0 ? clean(row[idxIsin])  : "";
-                    String stage = idxStage >= 0 ? clean(row[idxStage]) : "";
-                    String type  = idxType  >= 0 ? clean(row[idxType])  : deriveType(stage);
-                    int    code  = toStageCode(type, stage);
-                    map.put(symbol, new AsmRecord(symbol, isin, type, stage, code));
-                } catch (Exception e) {
-                    log.debug("[ASM] Skipping row: {}", String.join(",", row));
-                }
-            }
-        } catch (CsvValidationException e) {
-            throw new IOException("[ASM] CSV parse error: " + e.getMessage(), e);
-        }
-        return map;
-    }
-
-    private int findCol(String[] header, String... names) {
-        for (String name : names)
-            for (int i = 0; i < header.length; i++)
-                if (header[i].trim().equalsIgnoreCase(name)) return i;
-        return -1;
-    }
-
-    private String clean(String s) {
-        return s == null ? "" : s.trim().toUpperCase();
     }
 }

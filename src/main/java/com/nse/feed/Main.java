@@ -11,37 +11,24 @@ import java.nio.file.*;
 import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.ZoneId;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Entry point for the NSE → TradingView seed ETL.
  *
- * ─── Data Sources (verified 2026-05-17) ──────────────────────────────────────
+ * <h3>Data sources</h3>
+ * <ul>
+ *   <li>Full band master : nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv</li>
+ *   <li>Delta changes    : nsearchives.nseindia.com/content/equities/eq_band_changes_{ddmmyyyy}.csv</li>
+ *   <li>ASM (primary)   : nseindia.com/api/asm-securities?asmType=shortterm|longterm</li>
+ *   <li>ASM (fallback)  : REMARKS column + persisted data/asm_state.csv</li>
+ * </ul>
  *
- *  FULL band master : nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv
- *  DELTA changes    : nsearchives.nseindia.com/content/equities/eq_band_changes_{ddmmyyyy}.csv
- *                     NOTE: eq_band_changes is dated with NEXT trading day
- *  ASM list         : nseindia.com/api/asm-securities?asmType=shortterm|longterm
- *                     Requires session warm-up; falls back to REMARKS in delta CSV
+ * <h3>Run modes</h3>
+ * COLD-START (Monday / first run / --force-full) or DELTA (Tue–Fri).
  *
- * ─── Run Modes ────────────────────────────────────────────────────────────────
- *
- *  COLD-START (full extract) triggered when ANY of:
- *    a) data/cold_start.done sentinel missing   (first-ever run)
- *    b) today is MONDAY                         (weekly re-baseline)
- *    c) --force-full CLI flag
- *
- *  DELTA (incremental) — every other trading day (Tue–Fri).
- *
- *  NON-TRADING DAY GUARD:
- *    Weekend (Sat/Sun) → fast-exit code 0 before any HTTP calls.
- *    Holiday (Mon–Fri) → both sec_list and eq_band_changes return 404 → exit code 0.
- *
- * ─── CLI args ─────────────────────────────────────────────────────────────────
- *   --force-full            force cold-start regardless of sentinel
- *   --date YYYY-MM-DD       override trade date (default: today IST)
+ * <h3>CLI</h3>
+ * {@code --force-full}  {@code --date YYYY-MM-DD}
  */
 public class Main {
 
@@ -50,142 +37,122 @@ public class Main {
     private static final String SENTINEL_FILE = DATA_DIR + "/cold_start.done";
 
     public static void main(String[] args) throws Exception {
-        log.info("======================================================");
+        log.info("=====================================================");
         log.info(" NSE TradingView Feed ETL — started");
-        log.info("======================================================");
+        log.info("=====================================================");
 
-        // ── Parse CLI args ────────────────────────────────────────────────────
-        List<String> argList = Arrays.asList(args);
-        boolean forceFull   = argList.contains("--force-full");
-        LocalDate tradeDate = parseDate(argList);
+        List<String> argList   = Arrays.asList(args);
+        boolean      forceFull = argList.contains("--force-full");
+        LocalDate    tradeDate = parseDate(argList);
 
         log.info("Trade date : {}", tradeDate);
         log.info("Day of week: {}", tradeDate.getDayOfWeek());
         log.info("Force-full : {}", forceFull);
 
-        // ── Weekend fast-exit ─────────────────────────────────────────────────
         if (NseClient.isWeekend(tradeDate) && !forceFull) {
-            log.info("Today is {} — NSE markets closed. Nothing to do. Exiting cleanly.",
-                    tradeDate.getDayOfWeek());
-            return; // exit 0
+            log.info("Weekend — NSE closed. Exiting.");
+            return;
         }
 
-        // ── Determine run mode ────────────────────────────────────────────────
         boolean coldStart = forceFull
                 || !sentinelExists()
                 || tradeDate.getDayOfWeek() == DayOfWeek.MONDAY;
 
-        log.info("Run mode   : {}",
-                coldStart ? "COLD-START (full extract)" : "DELTA (incremental)");
+        log.info("Run mode   : {}", coldStart ? "COLD-START" : "DELTA");
 
-        // ── Shared HTTP client ────────────────────────────────────────────────
         try (NseClient client = new NseClient()) {
 
-            DataMerger  merger  = new DataMerger();
-            SeedWriter  writer  = new SeedWriter(DATA_DIR);
+            DataMerger    merger   = new DataMerger();
+            SeedWriter    writer   = new SeedWriter(DATA_DIR);
+            AsmStateStore asmStore = new AsmStateStore(DATA_DIR);
+            AsmDownloader asmDl    = new AsmDownloader(client);
+
+            // Previous day's ASM state for forward-fill
+            Map<String, AsmRecord> prevAsmMap = coldStart
+                    ? Collections.emptyMap() : asmStore.load();
 
             if (coldStart) {
-                // ── COLD-START: download full sec_list ────────────────────────
-                PriceBandDownloader pbDownloader = new PriceBandDownloader(client);
-                List<PriceBandRecord> priceBands = pbDownloader.downloadFull(tradeDate);
 
+                PriceBandDownloader pbDl = new PriceBandDownloader(client);
+                List<PriceBandRecord> priceBands = pbDl.downloadFull(tradeDate);
                 if (priceBands.isEmpty()) {
-                    log.warn("[Cold-Start] sec_list empty for {}. Public holiday?", tradeDate);
-                    log.info("ETL skipped — no price band data. Exit code 0.");
+                    log.warn("sec_list empty — public holiday? Exiting.");
                     return;
                 }
-                log.info("Price band records (full): {}", priceBands.size());
+                log.info("Price band records: {}", priceBands.size());
 
-                // ASM: try session API; fall back to empty map on holiday
-                Map<String, AsmRecord> asmMap = downloadAsmWithFallback(
-                        client, null, tradeDate, forceFull);
+                Map<String, AsmRecord> asmMap = downloadAsmSafe(asmDl, null, tradeDate);
                 log.info("ASM records: {}", asmMap.size());
+                asmStore.save(asmMap);
 
-                List<MergedRecord> merged = merger.mergeFull(priceBands, asmMap);
-                writer.write(merged);
+                writer.write(merger.mergeFull(priceBands, asmMap));
                 writeSentinel(tradeDate);
-                log.info("Sentinel written: {}", SENTINEL_FILE);
 
             } else {
-                // ── DELTA: eq_band_changes (NEXT trading day filename) ─────────
-                DeltaBandUpdater deltaUpdater = new DeltaBandUpdater(client);
-                Map<String, PriceBandRecord> deltaMap =
-                        deltaUpdater.downloadAndParse(tradeDate);
-                log.info("Band changes today: {}", deltaMap.size());
 
-                // ASM: try session API; fall back to REMARKS in deltaMap
-                Map<String, AsmRecord> asmMap = downloadAsmWithFallback(
-                        client, deltaMap, tradeDate, forceFull);
-                log.info("ASM records: {}", asmMap.size());
+                DeltaBandUpdater delta = new DeltaBandUpdater(client);
+                Map<String, PriceBandRecord> deltaMap = delta.downloadAndParse(tradeDate);
+                log.info("Band changes: {}", deltaMap.size());
 
-                if (deltaMap.isEmpty() && asmMap.isEmpty()) {
-                    log.info("No band changes and no ASM data — nothing to write.");
+                Map<String, AsmRecord> freshAsmMap = downloadAsmSafe(asmDl, deltaMap, tradeDate);
+
+                // Forward-fill: if session API returned nothing, keep previous state
+                Map<String, AsmRecord> effectiveAsm =
+                        freshAsmMap.isEmpty() ? prevAsmMap : freshAsmMap;
+                log.info("Effective ASM (after forward-fill): {}", effectiveAsm.size());
+
+                asmStore.save(effectiveAsm);
+
+                if (!deltaMap.isEmpty() || !effectiveAsm.isEmpty()) {
+                    writer.write(merger.mergeDelta(deltaMap, effectiveAsm, prevAsmMap));
                 } else {
-                    List<MergedRecord> merged = merger.mergeDelta(deltaMap, asmMap);
-                    writer.write(merged);
+                    log.info("No changes — nothing to write.");
                 }
             }
         }
 
-        log.info("======================================================");
+        log.info("=====================================================");
         log.info(" ETL complete.");
-        log.info("======================================================");
+        log.info("=====================================================");
     }
 
-    // ── ASM download with REMARKS fallback ────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /**
-     * Tries the session-based ASM API first.
-     * If it returns empty (session blocked, holiday, etc.), falls back to
-     * deriving ASM symbols from REMARKS in the deltaMap (may be null for cold-start).
-     */
-    private static Map<String, AsmRecord> downloadAsmWithFallback(
-            NseClient client,
+    private static Map<String, AsmRecord> downloadAsmSafe(
+            AsmDownloader asmDl,
             Map<String, PriceBandRecord> deltaMap,
-            LocalDate date,
-            boolean forceFull) {
-
-        AsmDownloader asmDownloader = new AsmDownloader(client);
-        Map<String, AsmRecord> asmMap;
-        try {
-            asmMap = asmDownloader.download(date);
-        } catch (IOException e) {
-            log.warn("[ASM] download threw: {}. Using empty map.", e.getMessage());
-            asmMap = new java.util.HashMap<>();
+            LocalDate date) {
+        Map<String, AsmRecord> map;
+        try { map = asmDl.download(date); }
+        catch (IOException e) {
+            log.warn("[ASM] Download error: {}. Using empty.", e.getMessage());
+            map = Collections.emptyMap();
         }
-
-        // If session API gave us nothing and we have a delta map, use REMARKS
-        if (asmMap.isEmpty() && deltaMap != null && !deltaMap.isEmpty()) {
-            log.info("[ASM] Session API empty — deriving from band-change REMARKS...");
-            asmMap = asmDownloader.deriveFromRemarks(deltaMap);
+        if (map.isEmpty() && deltaMap != null && !deltaMap.isEmpty()) {
+            log.info("[ASM] Supplementing with REMARKS fallback.");
+            map = asmDl.deriveFromRemarks(deltaMap);
         }
-        return asmMap;
+        return map;
     }
-
-    // ── Sentinel helpers ──────────────────────────────────────────────────────
 
     private static boolean sentinelExists() {
         return Files.exists(Paths.get(SENTINEL_FILE));
     }
 
     private static void writeSentinel(LocalDate date) throws IOException {
-        Path sentinel = Paths.get(SENTINEL_FILE);
-        Files.createDirectories(sentinel.getParent());
-        Files.writeString(sentinel,
-                "Last full extract: " + date + "\n"
-              + "Next full extract: next Monday or --force-full\n",
-                StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+        Path p = Paths.get(SENTINEL_FILE);
+        Files.createDirectories(p.getParent());
+        Files.writeString(p,
+            "Last full extract: " + date + "\n" +
+            "Next full extract: next Monday or --force-full\n",
+            StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
-
-    // ── CLI helpers ───────────────────────────────────────────────────────────
 
     private static LocalDate parseDate(List<String> args) {
         int idx = args.indexOf("--date");
         if (idx >= 0 && idx + 1 < args.size()) {
             try { return LocalDate.parse(args.get(idx + 1)); }
-            catch (Exception e) {
-                log.warn("Invalid --date '{}', using today IST.", args.get(idx + 1));
-            }
+            catch (Exception e) { log.warn("Bad --date — using today IST."); }
         }
         return LocalDate.now(ZoneId.of("Asia/Kolkata"));
     }
