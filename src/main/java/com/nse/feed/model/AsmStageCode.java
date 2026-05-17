@@ -5,18 +5,21 @@ package com.nse.feed.model;
  *
  * <pre>
  *  0        = no surveillance
- *  11-13    = STASM Stage I / II / III     (short-term)
- *  21-23    = LTASM Stage I / II / III     (long-term, NON-overlapping range)
+ *  11-14    = STASM Stage I / II / III / IV  (short-term)
+ *  21-24    = LTASM Stage I / II / III / IV  (long-term, NON-overlapping range)
  *  30       = GSM
  * </pre>
  *
  * Pine Script reads the ASM_CODE column from nse_metadata.csv:
  * <pre>
  *   int asm = asmCode
- *   bool inStasm = asm >= 11 and asm <= 13
- *   bool inLtasm = asm >= 21 and asm <= 23
+ *   bool inStasm = asm >= 11 and asm <= 14
+ *   bool inLtasm = asm >= 21 and asm <= 24
  *   bool inGsm   = asm == 30
  *   bool inAsm   = asm > 0
+ *   // Stage-specific:
+ *   bool ltasmStage1 = asm == 21
+ *   bool ltasmStage2 = asm == 22
  * </pre>
  */
 public enum AsmStageCode {
@@ -25,9 +28,11 @@ public enum AsmStageCode {
     STASM_I   (11),
     STASM_II  (12),
     STASM_III (13),
+    STASM_IV  (14),
     LTASM_I   (21),
     LTASM_II  (22),
     LTASM_III (23),
+    LTASM_IV  (24),
     GSM       (30);
 
     /** The integer written to the CSV / used in Pine. */
@@ -44,7 +49,7 @@ public enum AsmStageCode {
      * Encodes ASM type + stage text into the canonical enum constant.
      *
      * @param type  e.g. "STASM", "LTASM", "GSM", "ASM", "shortterm", "longterm"
-     * @param stage e.g. "I", "II", "III", "1", "2", "3", ""
+     * @param stage e.g. "I", "II", "III", "IV", "1", "2", "3", "4", ""
      */
     public static AsmStageCode encode(String type, String stage) {
         int n  = stageNum(stage);
@@ -65,9 +70,11 @@ public enum AsmStageCode {
             case STASM_I   -> "STASM-I";
             case STASM_II  -> "STASM-II";
             case STASM_III -> "STASM-III";
+            case STASM_IV  -> "STASM-IV";
             case LTASM_I   -> "LTASM-I";
             case LTASM_II  -> "LTASM-II";
             case LTASM_III -> "LTASM-III";
+            case LTASM_IV  -> "LTASM-IV";
             case GSM       -> "GSM";
             default        -> "";
         };
@@ -76,17 +83,27 @@ public enum AsmStageCode {
     // ── Private helpers ───────────────────────────────────────────────────────
 
     private static AsmStageCode stasm(int n) {
-        return switch (n) { case 2 -> STASM_II; case 3 -> STASM_III; default -> STASM_I; };
+        return switch (n) {
+            case 2  -> STASM_II;
+            case 3  -> STASM_III;
+            case 4  -> STASM_IV;
+            default -> STASM_I;
+        };
     }
 
     private static AsmStageCode ltasm(int n) {
-        return switch (n) { case 2 -> LTASM_II; case 3 -> LTASM_III; default -> LTASM_I; };
+        return switch (n) {
+            case 2  -> LTASM_II;
+            case 3  -> LTASM_III;
+            case 4  -> LTASM_IV;
+            default -> LTASM_I;
+        };
     }
 
     private static int stageNum(String stage) {
         if (stage == null) return 1;
         String u = stage.trim().toUpperCase();
-        if (u.contains("IV") || u.equals("4")) return 4;  // future-proof
+        if (u.contains("IV") || u.equals("4"))  return 4;
         if (u.contains("III") || u.equals("3")) return 3;
         if (u.contains("II")  || u.equals("2")) return 2;
         return 1;

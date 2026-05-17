@@ -13,29 +13,64 @@ import java.time.LocalDate;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
- * Downloads and parses the NSE ASM surveillance list.
+ * Downloads and parses the NSE ASM surveillance list from {@code /api/reportASM}.
  *
- * <h3>Strategy (ordered by reliability)</h3>
- * <ol>
- *   <li><b>Session JSON API</b> — {@code /api/asm-securities?asmType=shortterm|longterm}<br>
- *       Parsed with Jackson ObjectMapper (replaces fragile regex scanner).</li>
- *   <li><b>REMARKS fallback</b> — derives ASM flags from the REMARKS column of
- *       eq_band_changes. Only covers stocks whose band changed that day;
- *       remaining symbols are forward-filled from the persisted asm_state.csv
- *       via {@link AsmStateStore} in Main.</li>
- * </ol>
+ * <h3>Actual JSON structure (verified 2026-05-17)</h3>
+ * <pre>
+ * {
+ *   "longterm": {
+ *     "data": [
+ *       {
+ *         "symbol":           "21STCENMGM",
+ *         "series":           null,
+ *         "companyName":      "21st Century Management Services Limited",
+ *         "isin":             "INE253B01015",
+ *         "asmSurvIndicator": "Stage I",       ← stage text
+ *         "asmTime":          "15-May-2026",   ← effective date
+ *         "survCode":         "LTASM - I (13)", ← (13) = NSE list revision #
+ *         "survDesc":         "Long Term Additional Surveillance Measure (LTASM) - Stage I",
+ *         "srno":             1
+ *       }, ...
+ *     ]
+ *   },
+ *   "shortterm": {
+ *     "data": [
+ *       {
+ *         "symbol":           "63MOONS",
+ *         "asmSurvIndicator": "Stage I",
+ *         "asmTime":          "15-May-2026",
+ *         "survCode":         "STASM - I (11)", ← (11) = NSE list revision #
+ *         ...
+ *       }, ...
+ *     ]
+ *   }
+ * }
+ * </pre>
  *
- * <h3>Stage code contract</h3>
- * All codes are canonical {@link AsmStageCode} enum values.
- * Non-overlapping ranges: STASM 11-13, LTASM 21-23, GSM 30.
+ * <h3>survCode bracket number significance</h3>
+ * The number in brackets (e.g. 13 in "LTASM - I (13)") is NSE's internal
+ * list revision counter — it increments each time NSE updates/republishes that
+ * surveillance list. It is NOT a stage number. It is captured as
+ * {@code circRevision} for audit/tracking but has no trading significance.
+ *
+ * <h3>Fallback strategy</h3>
+ * If the API call fails, {@link #deriveFromRemarks} derives ASM flags from
+ * the REMARKS column of eq_band_changes. This only covers stocks whose band
+ * changed that day; remaining symbols must be forward-filled from asm_state.csv
+ * via {@link AsmStateStore} in Main.
  */
 public class AsmDownloader {
 
     private static final Logger log = LoggerFactory.getLogger(AsmDownloader.class);
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    /** Extracts the revision number from survCode, e.g. "LTASM - I (13)" → 13 */
+    private static final Pattern CIRC_REVISION_PATTERN = Pattern.compile("\\((\\d+)\\)");
 
     private final NseClient client;
 
@@ -46,23 +81,23 @@ public class AsmDownloader {
     // ── Public API ────────────────────────────────────────────────────────────
 
     /**
-     * Downloads STASM + LTASM lists from the NSE session API.
+     * Downloads STASM + LTASM lists from {@code /api/reportASM}.
      *
-     * @return symbol → AsmRecord (EMPTY, never null, on any failure)
+     * @return symbol → AsmRecord (EMPTY map, never null, on any failure)
      */
     public Map<String, AsmRecord> download(LocalDate date) throws IOException {
-        log.info("[ASM] Session API download for: {}", date);
+        log.info("[ASM] Fetching /api/reportASM for: {}", date);
 
         String json;
         try {
             json = client.downloadAsmJson();
         } catch (IOException e) {
-            log.warn("[ASM] Session API I/O failure: {}. Using empty map.", e.getMessage());
+            log.warn("[ASM] API I/O failure: {}. Using empty map.", e.getMessage());
             return Collections.emptyMap();
         }
 
         if (json == null || json.isBlank()) {
-            log.warn("[ASM] Session API returned empty response.");
+            log.warn("[ASM] /api/reportASM returned empty response.");
             return Collections.emptyMap();
         }
 
@@ -70,21 +105,20 @@ public class AsmDownloader {
         try {
             JsonNode root = MAPPER.readTree(json);
 
-            // Combined wrapper: {"shortterm": [...], "longterm": [...]}
-            if (root.has("shortterm") || root.has("longterm")) {
-                parseHalf(root.path("shortterm"), "STASM", result);
-                parseHalf(root.path("longterm"),  "LTASM", result);
+            // Primary path: combined {"longterm":{"data":[...]}, "shortterm":{"data":[...]}}
+            if (root.has("longterm") || root.has("shortterm")) {
+                parseSection(root.path("longterm"),  "LTASM", result);
+                parseSection(root.path("shortterm"), "STASM", result);
             }
-            // Direct array: [{...}, ...]
+            // Direct array fallback
             else if (root.isArray()) {
                 parseArray(root, "ASM", result);
             }
-            // {"data": [{...}, ...]}
-            else if (root.has("data")) {
-                JsonNode data = root.get("data");
-                if (data.isArray()) parseArray(data, "ASM", result);
+            // {"data": [...]} wrapper fallback
+            else if (root.has("data") && root.get("data").isArray()) {
+                parseArray(root.get("data"), "ASM", result);
             }
-            // Single-key object whose value is an array
+            // Unknown structure — iterate top-level keys that hold arrays
             else {
                 root.fields().forEachRemaining(entry -> {
                     if (entry.getValue().isArray()) {
@@ -94,12 +128,12 @@ public class AsmDownloader {
                 });
             }
         } catch (Exception e) {
-            log.error("[ASM] Jackson parse error: {}. Raw snippet: {}",
-                    e.getMessage(), json.substring(0, Math.min(200, json.length())));
+            log.error("[ASM] Parse error: {}. Raw snippet: {}",
+                    e.getMessage(), json.substring(0, Math.min(300, json.length())));
             return Collections.emptyMap();
         }
 
-        log.info("[ASM] Session API: {} ASM symbols.", result.size());
+        log.info("[ASM] Parsed {} ASM symbols (LT+ST combined).", result.size());
         return Collections.unmodifiableMap(result);
     }
 
@@ -116,8 +150,8 @@ public class AsmDownloader {
             if (remarks == null || !remarks.toUpperCase().contains("ASM")) continue;
             String upper = remarks.toUpperCase();
             String type  = deriveType(upper);
-            String stage = deriveStage(upper);
-            result.put(symbol, AsmRecord.of(symbol, "", type, stage));
+            String stage = deriveStageFromText(upper);
+            result.put(symbol, AsmRecord.of(symbol, "", "", type, stage, "", 0));
             log.info("[ASM] Derived from REMARKS: {} → {} {}", symbol, type, stage);
         }
         log.info("[ASM] REMARKS fallback: {} symbols.", result.size());
@@ -127,41 +161,74 @@ public class AsmDownloader {
     // ── Jackson parsing helpers ───────────────────────────────────────────────
 
     /**
-     * Parses one half of the combined JSON response (shortterm or longterm array).
-     * Handles both wrapped ({"data":[...]}) and bare array formats.
+     * Parses one section of the reportASM response.
+     * Handles both {"data":[...]} wrapper and bare array formats.
      */
-    private void parseHalf(JsonNode node, String defaultType, Map<String, AsmRecord> out) {
-        if (node.isMissingNode()) return;
-        // Node might be array directly, or {"data":[...]}
-        JsonNode arr = node.isArray() ? node
-                     : node.has("data") && node.get("data").isArray() ? node.get("data")
-                     : node;
-        if (arr.isArray()) parseArray(arr, defaultType, out);
+    private void parseSection(JsonNode sectionNode, String defaultType, Map<String, AsmRecord> out) {
+        if (sectionNode == null || sectionNode.isMissingNode()) return;
+        // Section is {"data":[...]} — primary path from reportASM
+        if (sectionNode.has("data") && sectionNode.get("data").isArray()) {
+            parseArray(sectionNode.get("data"), defaultType, out);
+        }
+        // Bare array fallback
+        else if (sectionNode.isArray()) {
+            parseArray(sectionNode, defaultType, out);
+        }
     }
 
     /**
-     * Iterates a JSON array of ASM objects, extracting symbol + stage.
-     * Field name variants handled: NSE's API has changed field names across years.
+     * Iterates a JSON array of ASM objects, extracting all fields from the
+     * actual /api/reportASM response structure.
+     *
+     * <p>Field mapping from reportASM response:
+     * <ul>
+     *   <li>{@code symbol}           → AsmRecord.symbol
+     *   <li>{@code companyName}      → AsmRecord.companyName
+     *   <li>{@code isin}             → AsmRecord.isin
+     *   <li>{@code asmSurvIndicator} → stage text ("Stage I" … "Stage IV")
+     *   <li>{@code asmTime}          → asOfDate ("15-May-2026")
+     *   <li>{@code survCode}         → survCode ("LTASM - I (13)")
+     *   <li>extracted from survCode  → circRevision (13)
+     * </ul>
      */
     private void parseArray(JsonNode arr, String defaultType, Map<String, AsmRecord> out) {
-        if (!arr.isArray()) return;
+        if (arr == null || !arr.isArray()) return;
         for (JsonNode obj : arr) {
-            String symbol = firstNonBlank(obj,
-                    "symbol", "SYMBOL", "scrip", "scripCode", "SCRIP");
+            if (!obj.isObject()) continue;
+
+            // Symbol — try multiple field name variants
+            String symbol = firstNonBlank(obj, "symbol", "SYMBOL", "scrip", "scripCode", "SCRIP");
             if (symbol == null || symbol.isBlank()) continue;
             symbol = symbol.trim().toUpperCase();
 
-            String isin     = firstNonBlankOrEmpty(obj, "isin", "ISIN");
-            String rawType  = firstNonBlankOrEmpty(obj,
+            // Core fields from actual reportASM response
+            String companyName = firstNonBlankOrEmpty(obj, "companyName", "company_name", "name");
+            String isin        = firstNonBlankOrEmpty(obj, "isin", "ISIN");
+            String asOfDate    = firstNonBlankOrEmpty(obj, "asmTime", "asmtime", "date");
+            String survCode    = firstNonBlankOrEmpty(obj, "survCode", "survcode", "surveillance_code");
+
+            // Stage: asmSurvIndicator holds "Stage I", "Stage II" etc.
+            String stageRaw    = firstNonBlankOrEmpty(obj,
+                    "asmSurvIndicator", "asmSurvindicator",
+                    "asmStage", "asmstage", "stage", "STAGE",
+                    "surveillanceStage");
+
+            // Type: if not explicit, use the section's defaultType (LTASM / STASM)
+            String typeRaw = firstNonBlankOrEmpty(obj,
                     "asmType", "asmtype", "surveillanceType", "type", "TYPE");
-            String rawStage = firstNonBlankOrEmpty(obj,
-                    "asmStage", "asmstage", "stage", "STAGE", "surveillanceStage");
+            if (typeRaw.isBlank()) typeRaw = defaultType;
 
-            // Derive type from field content when explicit field is absent
-            if (rawType.isBlank())  rawType  = defaultType;
-            if (rawStage.isBlank()) rawStage = deriveStage(obj.toString().toUpperCase());
+            // Derive canonical stage string from indicator text or survCode
+            String stage = deriveStageFromText(stageRaw.toUpperCase());
+            if (stage.isBlank() && !survCode.isBlank()) {
+                stage = deriveStageFromText(survCode.toUpperCase());
+            }
+            if (stage.isBlank()) stage = "I";  // safe default
 
-            out.put(symbol, AsmRecord.of(symbol, isin, rawType, rawStage));
+            // Extract list revision number from survCode brackets: "LTASM - I (13)" → 13
+            int circRevision = extractCircRevision(survCode);
+
+            out.put(symbol, AsmRecord.of(symbol, companyName, isin, typeRaw, stage, asOfDate, circRevision));
         }
     }
 
@@ -180,22 +247,45 @@ public class AsmDownloader {
         return v == null ? "" : v;
     }
 
+    /**
+     * Extracts revision number from survCode brackets.
+     * "LTASM - I (13)" → 13
+     * "STASM - I (11)" → 11
+     * ""               → 0
+     */
+    static int extractCircRevision(String survCode) {
+        if (survCode == null || survCode.isBlank()) return 0;
+        Matcher m = CIRC_REVISION_PATTERN.matcher(survCode);
+        return m.find() ? Integer.parseInt(m.group(1)) : 0;
+    }
+
     // ── Type / Stage derivation from text ─────────────────────────────────────
 
     static String deriveType(String upper) {
         if (upper.contains("LTASM"))                                      return "LTASM";
         if (upper.contains("STASM"))                                      return "STASM";
-        if (upper.contains("SHORTTERM") || upper.contains("SHORT TERM")) return "STASM";
-        if (upper.contains("LONGTERM")  || upper.contains("LONG TERM"))  return "LTASM";
+        if (upper.contains("SHORTTERM") || upper.contains("SHORT TERM") ||
+            upper.contains("SHORT-TERM"))                                 return "STASM";
+        if (upper.contains("LONGTERM")  || upper.contains("LONG TERM")  ||
+            upper.contains("LONG-TERM"))                                  return "LTASM";
         if (upper.contains("GSM"))                                        return "GSM";
         if (upper.contains("ASM"))                                        return "STASM";
         return "";
     }
 
-    static String deriveStage(String upper) {
-        if (upper.contains("III") || upper.contains("STAGE 3") || upper.contains("STAGE3")) return "III";
-        if (upper.contains("II")  || upper.contains("STAGE 2") || upper.contains("STAGE2")) return "II";
-        if (upper.contains("I")   || upper.contains("STAGE 1") || upper.contains("STAGE1")) return "I";
-        return "I";
+    /**
+     * Derives canonical stage string ("I", "II", "III", "IV") from any text
+     * that may contain "Stage I", "Stage 1", "STAGE III", roman numerals, etc.
+     */
+    static String deriveStageFromText(String upper) {
+        if (upper == null) return "I";
+        // Check IV before III/II to avoid partial matches
+        if (upper.contains("IV")    || upper.contains("STAGE 4") || upper.contains("STAGE4")) return "IV";
+        if (upper.contains("III")   || upper.contains("STAGE 3") || upper.contains("STAGE3")) return "III";
+        if (upper.contains(" II ")  || upper.contains("STAGE 2") || upper.contains("STAGE2") ||
+            upper.endsWith(" II")   || upper.contains("- II"))                               return "II";
+        if (upper.contains(" I ")   || upper.contains("STAGE 1") || upper.contains("STAGE1") ||
+            upper.endsWith(" I")    || upper.contains("- I"))                                return "I";
+        return "I";  // default
     }
 }

@@ -18,12 +18,20 @@ import java.util.Map;
  * Audit / debug: compare this file against the NSE surveillance page or
  * nse_metadata.csv to verify that no ASM flag was silently dropped.
  *
- * <h3>File format</h3>
+ * <h3>File format (updated to include all reportASM fields)</h3>
  * <pre>
- *   DATE,SYMBOL,ISIN,TYPE,STAGE,STAGE_CODE,LABEL
- *   2026-05-19,AARTIIND,,STASM,I,11,STASM-I
- *   2026-05-19,YESBANK,,LTASM,II,22,LTASM-II
+ *   DATE,SYMBOL,COMPANY_NAME,ISIN,TYPE,STAGE,STAGE_CODE,LABEL,AS_OF_DATE,CIRC_REVISION
+ *   2026-05-15,21STCENMGM,21st Century Management Services Limited,INE253B01015,LTASM,I,21,LTASM-I,15-May-2026,13
+ *   2026-05-15,63MOONS,63 moons technologies limited,INE111B01023,STASM,I,11,STASM-I,15-May-2026,11
  * </pre>
+ *
+ * <h3>Column notes</h3>
+ * <ul>
+ *   <li>{@code STAGE_CODE}     — Integer for Pine Script: 11-14=STASM, 21-24=LTASM, 30=GSM
+ *   <li>{@code CIRC_REVISION}  — NSE's internal list revision counter from survCode brackets
+ *                                (e.g. 13 from "LTASM - I (13)"). Not a stage number.
+ *   <li>{@code AS_OF_DATE}     — Effective date string from NSE's asmTime field
+ * </ul>
  *
  * Written atomically (.tmp → rename) so the file is never partially visible.
  */
@@ -32,7 +40,8 @@ public class AsmFullWriter {
     private static final Logger log = LoggerFactory.getLogger(AsmFullWriter.class);
     private static final String FILENAME     = "nse_asm_full.csv";
     private static final String FILENAME_TMP = "nse_asm_full.csv.tmp";
-    private static final String HEADER = "DATE,SYMBOL,ISIN,TYPE,STAGE,STAGE_CODE,LABEL";
+    private static final String HEADER =
+            "DATE,SYMBOL,COMPANY_NAME,ISIN,TYPE,STAGE,STAGE_CODE,LABEL,AS_OF_DATE,CIRC_REVISION";
 
     private final Path dataDir;
 
@@ -46,7 +55,7 @@ public class AsmFullWriter {
      */
     public void write(LocalDate date, Map<String, AsmRecord> asmMap) throws IOException {
         Files.createDirectories(dataDir);
-        Path tmp   = dataDir.resolve(FILENAME_TMP);
+        Path tmp    = dataDir.resolve(FILENAME_TMP);
         Path final_ = dataDir.resolve(FILENAME);
 
         try (BufferedWriter bw = Files.newBufferedWriter(
@@ -66,11 +75,14 @@ public class AsmFullWriter {
                           bw.write(String.join(",",
                                   date.toString(),
                                   safe(r.symbol()),
+                                  safeCsv(r.companyName()),   // quoted — may contain commas
                                   safe(r.isin()),
                                   safe(r.type()),
                                   safe(r.stage()),
                                   String.valueOf(r.stageCode().code),
-                                  safe(r.stageCode().label())));
+                                  safe(r.stageCode().label()),
+                                  safe(r.asOfDate()),
+                                  String.valueOf(r.circRevision())));
                           bw.newLine();
                       } catch (IOException e) {
                           throw new RuntimeException(e);
@@ -85,5 +97,17 @@ public class AsmFullWriter {
         log.info("[AsmFullWriter] {} ASM records → {}", asmMap.size(), final_.toAbsolutePath());
     }
 
-    private String safe(String s) { return s == null ? "" : s.trim(); }
+    /** Trims and returns empty string for null. */
+    private String safe(String s) {
+        return s == null ? "" : s.trim();
+    }
+
+    /**
+     * CSV-safe: wraps value in double quotes and escapes internal quotes.
+     * Used for companyName which may contain commas (e.g. "Jain Irrigation Systems, Ltd.").
+     */
+    private String safeCsv(String s) {
+        if (s == null) return "\"\"";
+        return "\"" + s.trim().replace("\"", "\"\"") + "\"";
+    }
 }

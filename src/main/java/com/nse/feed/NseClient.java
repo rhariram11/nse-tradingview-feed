@@ -35,15 +35,23 @@ import java.time.format.DateTimeFormatter;
  *   - No session/cookie needed
  *   - ~5-50 rows: SYMBOL, SERIES, PRICE_BAND_NEW, PRICE_BAND_OLD, EFFECTIVE_DATE, REMARKS
  *
- * ASM surveillance list:
- *   https://www.nseindia.com/api/asm-securities?asmType=shortterm
- *   https://www.nseindia.com/api/asm-securities?asmType=longterm
+ * ASM surveillance list (VERIFIED 2026-05-17):
+ *   https://www.nseindia.com/api/reportASM
+ *   - Returns SINGLE combined JSON:
+ *     {
+ *       "longterm":  { "data": [{symbol, asmSurvIndicator, asmTime, survCode, companyName, isin, ...}] },
+ *       "shortterm": { "data": [{...}] }
+ *     }
+ *   - survCode format: "LTASM - I (13)"  where (13) = NSE list revision number
+ *   - asmSurvIndicator: "Stage I" | "Stage II" | "Stage III" | "Stage IV"
  *   - Requires session warm-up (homepage GET → cookie capture → API call)
  *   - Fallback: derive from REMARKS column in eq_band_changes (contains "ASM Stage N")
  *
  * ── What NOT to use ──────────────────────────────────────────────────────────
- *   https://www.nseindia.com/api/reports?archives=...  ← requires live browser session
- *   Returns 404 for all files from headless Java HTTP clients.
+ *   /api/liveSurveillance?value=long_term_asm   ← RETIRED, returns 404
+ *   /api/liveSurveillance?value=short_term_asm  ← RETIRED, returns 404
+ *   /api/asm-securities?asmType=shortterm       ← Old endpoint, may 404
+ *   /api/reports?archives=...                   ← requires live browser session
  */
 public class NseClient implements AutoCloseable {
 
@@ -57,11 +65,12 @@ public class NseClient implements AutoCloseable {
     /** Session-gated API base — requires cookie warm-up first. */
     public static final String NSE_BASE = "https://www.nseindia.com";
 
-    /** ASM securities API endpoints (session required). */
-    public static final String ASM_SHORTTERM =
-            NSE_BASE + "/api/asm-securities?asmType=shortterm";
-    public static final String ASM_LONGTERM  =
-            NSE_BASE + "/api/asm-securities?asmType=longterm";
+    /**
+     * Combined ASM report endpoint (verified 2026-05-17).
+     * Returns: { "longterm": {"data": [...]}, "shortterm": {"data": [...]} }
+     * Replaces the old /api/asm-securities?asmType=shortterm|longterm split.
+     */
+    public static final String ASM_REPORT = NSE_BASE + "/api/reportASM";
 
     /**
      * Date format for nsearchives filenames: ddmmyyyy (no separators).
@@ -109,7 +118,7 @@ public class NseClient implements AutoCloseable {
         doGet(NSE_BASE);
         sleep(1500);
 
-        log.info("[NSE] Warm-up 2/2 — reports page...");
+        log.info("[NSE] Warm-up 2/2 — ASM reports page...");
         doGet(NSE_BASE + "/reports/asm");
         sleep(1500);
 
@@ -171,34 +180,33 @@ public class NseClient implements AutoCloseable {
     }
 
     /**
-     * Downloads ASM securities via session-gated API.
+     * Downloads ASM surveillance list from the single combined /api/reportASM endpoint.
      * Calls warmUpSession() automatically if not already done.
-     * Returns combined shortterm+longterm JSON, or null on failure.
+     *
+     * <p>The endpoint returns:
+     * <pre>
+     * {
+     *   "longterm":  { "data": [{symbol, asmSurvIndicator, asmTime, survCode, companyName, isin, ...}] },
+     *   "shortterm": { "data": [{...}] }
+     * }
+     * </pre>
+     *
+     * @return Raw JSON string from /api/reportASM, or null on failure
      */
     public String downloadAsmJson() throws IOException {
         warmUpSession();
         sleep(500);
 
-        String shortTerm = getWithSession(ASM_SHORTTERM, "reports/asm");
-        String longTerm  = getWithSession(ASM_LONGTERM,  "reports/asm");
-
-        if (shortTerm == null && longTerm == null) {
-            log.warn("[NSE] ASM session API returned null for both endpoints.");
-            return null;
+        String json = getWithSession(ASM_REPORT, "reports/asm");
+        if (json == null) {
+            log.warn("[NSE] /api/reportASM returned null — session may have expired.");
+        } else {
+            log.info("[NSE] /api/reportASM response size: {} bytes", json.length());
         }
-        if (shortTerm != null && longTerm != null) {
-            return "{\"shortterm\":" + shortTerm.trim()
-                 + ",\"longterm\":"
-                 + longTerm.trim() + "}";
-        }
-        return shortTerm != null ? shortTerm : longTerm;
+        return json;
     }
 
     // ── Core HTTP helpers ─────────────────────────────────────────────────────
-    //
-    // ParseException (thrown by EntityUtils.toString) is caught here and
-    // re-thrown as IOException so no caller needs to handle it separately.
-    // This keeps the entire public API throwing only IOException.
 
     /**
      * GET from nsearchives (no session needed).
