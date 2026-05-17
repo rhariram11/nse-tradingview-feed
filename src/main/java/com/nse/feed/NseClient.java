@@ -10,35 +10,67 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 
 /**
  * Handles all HTTP communication with NSE India.
  *
- * NSE Anti-Bot Protocol (MUST follow in order):
- *   1. GET https://www.nseindia.com                    → seeds nsit + nseappid cookies
- *   2. GET https://www.nseindia.com/market-data/       → seeds additional session cookies
- *   3. All subsequent API / file download calls must carry:
- *        - Cookie header  (auto-managed by BasicCookieStore)
- *        - Referer        https://www.nseindia.com/
- *        - X-Requested-With: XMLHttpRequest
+ * ── URL Strategy (verified 2026-05-17) ────────────────────────────────────────
  *
- * Non-trading days (weekends, holidays):
- *   NSE returns HTTP 404 for date-specific report files.
- *   Use getOrNull() instead of get() when a missing file is acceptable.
- *   get() throws IOException on 404; getOrNull() returns null silently.
+ * FULL price band master (all EQ symbols):
+ *   https://nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv
+ *   - Published on the CURRENT trading day
+ *   - No session/cookie needed — direct public URL
+ *   - ~2800 rows: SYMBOL, NAME_OF_COMPANY, SERIES, FACE_VALUE, PRICE_BAND ...
+ *
+ * DELTA band changes (changed symbols only):
+ *   https://nsearchives.nseindia.com/content/equities/eq_band_changes_{ddmmyyyy}.csv
+ *   - IMPORTANT: filename carries NEXT trading day's date
+ *     e.g. changes effective Monday are in file eq_band_changes_19052026.csv
+ *          published after Friday market close (16-May-2026 run)
+ *   - No session/cookie needed
+ *   - ~5-50 rows: SYMBOL, SERIES, PRICE_BAND_NEW, PRICE_BAND_OLD, EFFECTIVE_DATE, REMARKS
+ *
+ * ASM surveillance list:
+ *   https://www.nseindia.com/api/asm-securities?asmType=shortterm
+ *   https://www.nseindia.com/api/asm-securities?asmType=longterm
+ *   - Requires session warm-up (homepage GET → cookie capture → API call)
+ *   - Fallback: derive from REMARKS column in eq_band_changes (contains "ASM Stage N")
+ *
+ * ── What NOT to use ────────────────────────────────────────────────────────────
+ *   https://www.nseindia.com/api/reports?archives=...  ← requires live browser session
+ *   Returns 404 for all files from headless Java HTTP clients.
  */
 public class NseClient implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(NseClient.class);
 
-    public static final String BASE_URL = "https://www.nseindia.com";
+    // ── Base URLs ─────────────────────────────────────────────────────────────
+    /** Public archive — no session needed. Direct file downloads. */
+    public static final String ARCHIVE_BASE =
+            "https://nsearchives.nseindia.com/content/equities/";
 
-    /** Date format NSE expects in report API query params: 17-May-2026 */
-    public static final DateTimeFormatter NSE_DATE_FMT =
+    /** Session-gated API base — requires cookie warm-up first. */
+    public static final String NSE_BASE = "https://www.nseindia.com";
+
+    /** ASM securities API endpoints (session required). */
+    public static final String ASM_SHORTTERM =
+            NSE_BASE + "/api/asm-securities?asmType=shortterm";
+    public static final String ASM_LONGTERM  =
+            NSE_BASE + "/api/asm-securities?asmType=longterm";
+
+    /**
+     * Date format for nsearchives filenames: ddmmyyyy (no separators).
+     * Example: 16 May 2026 → "16052026"
+     */
+    public static final DateTimeFormatter FILE_DATE_FMT =
+            DateTimeFormatter.ofPattern("ddMMuuuu");
+
+    /** Friendly display format for log messages. */
+    public static final DateTimeFormatter DISPLAY_DATE_FMT =
             DateTimeFormatter.ofPattern("dd-MMM-yyyy");
 
     private static final String UA =
@@ -46,46 +78,12 @@ public class NseClient implements AutoCloseable {
           + "AppleWebKit/537.36 (KHTML, like Gecko) "
           + "Chrome/124.0.0.0 Safari/537.36";
 
-    // ── NSE archive JSON templates ────────────────────────────────────────────
-    //
-    // Full price band (circuit file) – all EQ symbols with current band %
-    // File: circuit_DDMMYYYY.csv
-    private static final String ARCHIVE_FULL_BAND =
-            "[{\"name\":\"Security Wise Daily Price Band\","
-          + "\"type\":\"daily\","
-          + "\"category\":\"capital-market\","
-          + "\"section\":\"equity\"}]";
-
-    // Delta band changes – only symbols whose band % changed today
-    // File: eq_band_changes_DDMMYYYY.csv
-    // Columns: Symbol, Series, New Band, Old Band, Effective Date
-    private static final String ARCHIVE_DELTA_BAND =
-            "[{\"name\":\"Equity Band Change\","
-          + "\"type\":\"daily\","
-          + "\"category\":\"capital-market\","
-          + "\"section\":\"equity\"}]";
-
-    // ASM / STASM / LTASM surveillance list
-    // File: asm_DDMMYYYY.csv
-    // NSE uses two slightly different name strings — we try primary first,
-    // then fall back to secondary if we get a 404.
-    public static final String ARCHIVE_ASM_PRIMARY =
-            "[{\"name\":\"Additional Surveillance Measure (ASM)\","
-          + "\"type\":\"daily\","
-          + "\"category\":\"surveillance\","
-          + "\"section\":\"equity\"}]";
-
-    public static final String ARCHIVE_ASM_FALLBACK =
-            "[{\"name\":\"ASM\","
-          + "\"type\":\"daily\","
-          + "\"category\":\"surveillance\","
-          + "\"section\":\"equity\"}]";
-
-    private static final String REPORT_API = BASE_URL + "/api/reports";
-
-    // ── HTTP client ───────────────────────────────────────────────────────────
+    // ── HTTP client (Apache HC5, cookie-aware) ────────────────────────────────
     private final BasicCookieStore cookieStore;
     private final CloseableHttpClient http;
+
+    /** Tracks whether warmUpSession() has been called this JVM run. */
+    private boolean sessionWarmed = false;
 
     public NseClient() {
         cookieStore = new BasicCookieStore();
@@ -94,141 +92,204 @@ public class NseClient implements AutoCloseable {
                 .build();
     }
 
-    // ── Session warm-up ───────────────────────────────────────────────────────
+    // ── Session warm-up (for session-gated API calls only) ────────────────────
 
     /**
-     * Two-step warm-up required by NSE to receive session cookies.
-     * Must be called once per JVM run before any download.
+     * Warms up the NSE session by fetching the homepage and a secondary page.
+     * This seeds the nsit + nseappid cookies required by /api/* endpoints.
+     *
+     * NOT needed for nsearchives.nseindia.com downloads.
      */
     public void warmUpSession() throws IOException {
-        log.info("[NSE] Warm-up 1/2 – homepage...");
-        doGet(BASE_URL);
+        if (sessionWarmed) {
+            log.debug("[NSE] Session already warmed — skipping.");
+            return;
+        }
+        log.info("[NSE] Warm-up 1/2 — homepage...");
+        doGet(NSE_BASE);
         sleep(1500);
 
-        log.info("[NSE] Warm-up 2/2 – market-data page...");
-        doGet(BASE_URL + "/market-data/securities-available-for-trading");
+        log.info("[NSE] Warm-up 2/2 — reports page...");
+        doGet(NSE_BASE + "/reports/asm");
         sleep(1500);
 
-        log.info("[NSE] Session ready. Cookies: {}", cookieStore.getCookies().size());
+        log.info("[NSE] Session ready. Cookies captured: {}", cookieStore.getCookies().size());
+        sessionWarmed = true;
     }
 
-    // ── Typed download methods ────────────────────────────────────────────────
+    // ── Public download methods ───────────────────────────────────────────────
 
     /**
-     * Full price band circuit file for given date.
-     * File: circuit_DDMMYYYY.csv (~2000 rows)
-     * Returns null if NSE returns 404 (non-trading day / holiday).
+     * Downloads sec_list_{ddmmyyyy}.csv — full price band master for all EQ symbols.
+     *
+     * Tries up to 7 calendar days backwards from {@code forDate} to find the
+     * latest available trading day file (handles bank holidays gracefully).
+     *
+     * @return CSV text, or null if no file found in 7-day window
      */
-    public byte[] downloadFullBandCsv(LocalDate date) throws IOException {
-        String url = buildReportUrl(ARCHIVE_FULL_BAND, date);
-        log.info("[NSE] Downloading FULL band file: {}", url);
-        return getOrNull(url);
-    }
-
-    /**
-     * Delta band-change file for given date.
-     * File: eq_band_changes_DDMMYYYY.csv (~10-50 rows, changed symbols only)
-     * Returns null if NSE returns 404 (non-trading day / no changes).
-     */
-    public byte[] downloadDeltaBandCsv(LocalDate date) throws IOException {
-        String url = buildReportUrl(ARCHIVE_DELTA_BAND, date);
-        log.info("[NSE] Downloading DELTA band file: {}", url);
-        return getOrNull(url);
-    }
-
-    /**
-     * ASM/STASM/LTASM surveillance list for given date.
-     * File: asm_DDMMYYYY.csv
-     * Tries primary archive name first; falls back to secondary on 404.
-     * Returns null if both return 404 (non-trading day).
-     */
-    public byte[] downloadAsmCsv(LocalDate date) throws IOException {
-        // Try primary archive name
-        String url = buildReportUrl(ARCHIVE_ASM_PRIMARY, date);
-        log.info("[NSE] Downloading ASM file (primary): {}", url);
-        byte[] bytes = getOrNull(url);
-
-        if (bytes == null) {
-            // 404 on primary → try fallback archive name
-            String fallbackUrl = buildReportUrl(ARCHIVE_ASM_FALLBACK, date);
-            log.info("[NSE] ASM primary 404 — trying fallback: {}", fallbackUrl);
-            bytes = getOrNull(fallbackUrl);
-        }
-
-        if (bytes == null) {
-            log.warn("[NSE] ASM file not available for date {} (non-trading day or holiday).", date);
-        }
-        return bytes; // null = not a trading day, caller handles gracefully
-    }
-
-    // ── Core HTTP methods ─────────────────────────────────────────────────────
-
-    /**
-     * GET url → bytes. Throws IOException on any non-200 status (including 404).
-     * Use this when the file MUST exist.
-     */
-    public byte[] get(String url) throws IOException {
-        try (CloseableHttpResponse resp = http.execute(buildGet(url))) {
-            int status = resp.getCode();
-            if (status != 200) {
-                throw new IOException("NSE HTTP " + status + " for: " + url);
+    public String downloadSecList(LocalDate forDate) throws IOException {
+        for (int i = 0; i <= 7; i++) {
+            LocalDate candidate = forDate.minusDays(i);
+            if (isWeekend(candidate)) continue;
+            String url = ARCHIVE_BASE + "sec_list_" + candidate.format(FILE_DATE_FMT) + ".csv";
+            log.info("[NSE] Trying sec_list: {}", url);
+            String body = getArchiveText(url);
+            if (body != null) {
+                log.info("[NSE] sec_list found for trading day: {}",
+                        candidate.format(DISPLAY_DATE_FMT));
+                return body;
             }
-            return EntityUtils.toByteArray(resp.getEntity());
         }
+        log.warn("[NSE] sec_list not found in last 7 days (forDate={}).", forDate);
+        return null;
     }
 
     /**
-     * GET url → bytes, or null if NSE returns 404 / 403.
-     * Use this for date-specific report files that may not exist on holidays.
+     * Downloads eq_band_changes_{ddmmyyyy}.csv — delta band changes.
+     *
+     * IMPORTANT: NSE names this file with the NEXT trading day's date.
+     * Strategy: try nextTradingDay(runDate) first, then runDate, then prevTradingDay.
+     * This handles runs at different times (pre-publish, post-publish, next-morning).
+     *
+     * @return CSV text, or null if no delta file published yet for this cycle
      */
-    public byte[] getOrNull(String url) throws IOException {
-        try (CloseableHttpResponse resp = http.execute(buildGet(url))) {
+    public String downloadBandChanges(LocalDate runDate) throws IOException {
+        LocalDate[] candidates = {
+            nextTradingDay(runDate),  // primary: file named with next trading day
+            runDate,                  // fallback 1: sometimes same-day naming
+            prevTradingDay(runDate)   // fallback 2: already-published from yesterday run
+        };
+
+        for (LocalDate candidate : candidates) {
+            String url = ARCHIVE_BASE + "eq_band_changes_" + candidate.format(FILE_DATE_FMT) + ".csv";
+            log.info("[NSE] Trying eq_band_changes: {}", url);
+            String body = getArchiveText(url);
+            if (body != null) {
+                log.info("[NSE] eq_band_changes found (file date-label: {}).",
+                        candidate.format(DISPLAY_DATE_FMT));
+                return body;
+            }
+        }
+        log.info("[NSE] eq_band_changes not available for runDate={}.", runDate);
+        return null;
+    }
+
+    /**
+     * Downloads ASM securities via session-gated API.
+     * Calls warmUpSession() automatically if not already done.
+     *
+     * Returns combined shortterm + longterm JSON string, or null on failure.
+     * On HTTP error the caller should fall back to deriving ASM from band-change REMARKS.
+     */
+    public String downloadAsmJson() throws IOException {
+        warmUpSession(); // idempotent
+        sleep(500);
+
+        String shortTerm = getWithSession(ASM_SHORTTERM, "reports/asm");
+        String longTerm  = getWithSession(ASM_LONGTERM,  "reports/asm");
+
+        if (shortTerm == null && longTerm == null) {
+            log.warn("[NSE] ASM session API returned null for both endpoints.");
+            return null;
+        }
+        // Return whichever succeeded — AsmDownloader merges both
+        if (shortTerm != null && longTerm != null) {
+            // Combine: strip trailing ] from shortTerm, strip leading [ from longTerm
+            String st = shortTerm.trim();
+            String lt = longTerm.trim();
+            // Both may be wrapped in {"data":[...]} — caller handles parsing
+            return "{\"shortterm\":" + st + ",\"longterm\":" + lt + "}";
+        }
+        return shortTerm != null ? shortTerm : longTerm;
+    }
+
+    // ── Core HTTP helpers ─────────────────────────────────────────────────────
+
+    /**
+     * GET from nsearchives (no session needed).
+     * Returns response body as UTF-8 String, or null on 404/403.
+     * Throws IOException on other non-200 statuses.
+     */
+    public String getArchiveText(String url) throws IOException {
+        try (CloseableHttpResponse resp = http.execute(buildGet(url, null))) {
             int status = resp.getCode();
+            if (status == 200) {
+                String body = EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8);
+                // Guard against empty or HTML error page
+                if (body == null || body.isBlank() || body.stripLeading().startsWith("<")) {
+                    log.debug("[NSE] 200 but empty/HTML body for: {}", url);
+                    return null;
+                }
+                return body;
+            }
             if (status == 404 || status == 403) {
-                log.debug("[NSE] HTTP {} for {} — treating as no-data (non-trading day)", status, url);
+                log.debug("[NSE] HTTP {} (not available): {}", status, url);
                 EntityUtils.consume(resp.getEntity());
                 return null;
             }
-            if (status != 200) {
-                throw new IOException("NSE HTTP " + status + " for: " + url);
-            }
-            return EntityUtils.toByteArray(resp.getEntity());
+            EntityUtils.consume(resp.getEntity());
+            throw new IOException("NSE archive HTTP " + status + " for: " + url);
         }
     }
 
-    // ── URL builder ───────────────────────────────────────────────────────────
-
     /**
-     * Builds a verified NSE report download URL.
-     * Pattern: /api/reports?archives=<encoded-json>&date=DD-MMM-YYYY&type=daily&mode=single
+     * GET with session cookies (for nseindia.com /api/* endpoints).
+     * Returns response body, or null on 404/403/401.
      */
-    public String buildReportUrl(String archiveJson, LocalDate date) {
-        String encodedArchive = URLEncoder.encode(archiveJson, StandardCharsets.UTF_8);
-        String dateStr = date.format(NSE_DATE_FMT); // e.g. 17-May-2026
-        return REPORT_API
-                + "?archives=" + encodedArchive
-                + "&date=" + dateStr
-                + "&type=daily"
-                + "&mode=single";
+    public String getWithSession(String url, String refererPath) throws IOException {
+        HttpGet req = buildGet(url, refererPath);
+        req.setHeader("Accept", "application/json, text/plain, */*");
+        req.setHeader("X-Requested-With", "XMLHttpRequest");
+        try (CloseableHttpResponse resp = http.execute(req)) {
+            int status = resp.getCode();
+            log.info("[NSE] {} → HTTP {}", url, status);
+            if (status == 200) {
+                return EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8);
+            }
+            EntityUtils.consume(resp.getEntity());
+            log.warn("[NSE] Session API HTTP {} for: {}", status, url);
+            return null;
+        }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Date utilities (static, reusable across the package) ─────────────────
+
+    public static boolean isWeekend(LocalDate d) {
+        return d.getDayOfWeek() == DayOfWeek.SATURDAY
+            || d.getDayOfWeek() == DayOfWeek.SUNDAY;
+    }
+
+    /** Next calendar day that is not Saturday or Sunday. */
+    public static LocalDate nextTradingDay(LocalDate d) {
+        LocalDate next = d.plusDays(1);
+        while (isWeekend(next)) next = next.plusDays(1);
+        return next;
+    }
+
+    /** Previous calendar day that is not Saturday or Sunday. */
+    public static LocalDate prevTradingDay(LocalDate d) {
+        LocalDate prev = d.minusDays(1);
+        while (isWeekend(prev)) prev = prev.minusDays(1);
+        return prev;
+    }
+
+    // ── Internal helpers ──────────────────────────────────────────────────────
 
     private void doGet(String url) throws IOException {
-        try (CloseableHttpResponse resp = http.execute(buildGet(url))) {
+        try (CloseableHttpResponse resp = http.execute(buildGet(url, null))) {
             EntityUtils.consume(resp.getEntity());
         }
     }
 
-    private HttpGet buildGet(String url) {
+    private HttpGet buildGet(String url, String refererPath) {
         HttpGet req = new HttpGet(url);
-        req.setHeader("User-Agent",       UA);
+        req.setHeader("User-Agent", UA);
         req.setHeader("Accept",
                 "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8");
-        req.setHeader("Accept-Language",  "en-US,en;q=0.9");
-        req.setHeader("Referer",          BASE_URL + "/");
-        req.setHeader("X-Requested-With", "XMLHttpRequest");
-        req.setHeader("Connection",       "keep-alive");
+        req.setHeader("Accept-Language", "en-US,en;q=0.9");
+        req.setHeader("Referer",
+                refererPath != null ? NSE_BASE + "/" + refererPath : NSE_BASE + "/");
+        req.setHeader("Connection", "keep-alive");
         return req;
     }
 

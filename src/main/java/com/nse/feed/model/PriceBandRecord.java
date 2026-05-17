@@ -1,20 +1,50 @@
 package com.nse.feed.model;
 
 /**
- * Immutable record representing one row from the NSE Daily Price Band report.
+ * Represents one row from either:
+ *   - sec_list_{ddmmyyyy}.csv    (full band master)
+ *   - eq_band_changes_{ddmmyyyy}.csv  (delta changes)
  *
- * @param symbol      NSE ticker symbol (e.g. RELIANCE)
- * @param series      NSE series (EQ, BE, SM, etc.)
- * @param prevClose   Previous day closing price
- * @param lowerBand   Absolute lower circuit price level
- * @param upperBand   Absolute upper circuit price level
- * @param bandPercent Percentage band (2, 5, 10, 20; 0 = no static band)
+ * The {@code remarks} field is populated from eq_band_changes REMARKS column.
+ * It carries ASM context (e.g. "ASM Stage 1", "LTASM Stage II") used by
+ * AsmDownloader.deriveFromRemarks() as a fallback when the session API is unavailable.
  */
-public record PriceBandRecord(
-        String symbol,
-        String series,
-        double prevClose,
-        double lowerBand,
-        double upperBand,
-        double bandPercent
-) {}
+public class PriceBandRecord {
+
+    private final String symbol;
+    private final String series;
+    private final double lastPrice;
+    private final double lowerBand;
+    private final double upperBand;
+    private final double bandPct;
+
+    /** From REMARKS column in eq_band_changes — may be null for full sec_list records. */
+    private String remarks;
+
+    public PriceBandRecord(String symbol, String series,
+                           double lastPrice, double lowerBand,
+                           double upperBand, double bandPct) {
+        this.symbol    = symbol;
+        this.series    = series;
+        this.lastPrice = lastPrice;
+        this.lowerBand = lowerBand;
+        this.upperBand = upperBand;
+        this.bandPct   = bandPct;
+    }
+
+    public String getSymbol()    { return symbol; }
+    public String getSeries()    { return series; }
+    public double getLastPrice() { return lastPrice; }
+    public double getLowerBand() { return lowerBand; }
+    public double getUpperBand() { return upperBand; }
+    public double getBandPct()   { return bandPct; }
+
+    public String getRemarks()           { return remarks; }
+    public void   setRemarks(String r)   { this.remarks = r; }
+
+    @Override
+    public String toString() {
+        return symbol + "|" + series + "|band=" + bandPct + "%"
+             + (remarks != null && !remarks.isEmpty() ? "|" + remarks : "");
+    }
+}

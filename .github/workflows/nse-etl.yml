@@ -1,13 +1,26 @@
 name: NSE EOD Feed ETL
 
-# Runs Monday–Saturday at 4:30 PM IST (11:00 UTC) — 1 hour after NSE market close
-# NSE publishes ASM and price band files shortly after 3:30 PM IST EOD
+# ── Schedule ────────────────────────────────────────────────────────────────
+# Runs Monday–Friday at 4:45 PM IST (11:15 UTC)
+#   - NSE market closes at 3:30 PM IST
+#   - eq_band_changes and sec_list are typically published by 4:00 PM IST
+#   - 15-min buffer built in
+# Saturday run removed — NSE does not publish data on Saturdays
 on:
   schedule:
-    - cron: '0 11 * * 1-6'
+    - cron: '15 11 * * 1-5'  # Mon-Fri 11:15 UTC = 4:45 PM IST
 
-  # Allow manual trigger from GitHub Actions UI for testing
+  # Manual trigger for testing / backfill
   workflow_dispatch:
+    inputs:
+      trade_date:
+        description: 'Trade date override (YYYY-MM-DD). Leave blank for today IST.'
+        required: false
+        default: ''
+      force_full:
+        description: 'Force cold-start full extract?'
+        required: false
+        default: 'false'
 
 jobs:
   run-etl:
@@ -32,16 +45,24 @@ jobs:
         run: mvn -q clean package -DskipTests
 
       - name: Run ETL
-        run: java -jar target/nse-feed-1.0.0.jar --force-full --date 2026-05-15
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.force_full }}" = "true" ]; then
+            ARGS="$ARGS --force-full"
+          fi
+          if [ -n "${{ github.event.inputs.trade_date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.trade_date }}"
+          fi
+          echo "Running: java -jar target/nse-feed-1.0.0.jar $ARGS"
+          java -jar target/nse-feed-1.0.0.jar $ARGS
         env:
-          # Reserve for future auth tokens / proxy settings if needed
-          NSE_USER_AGENT: 'Mozilla/5.0 (compatible; NSE-Feed-Bot/1.0)'
+          TZ: Asia/Kolkata
 
       - name: Commit data files
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/
-          # Only commit if there are changes
-          git diff --cached --quiet || git commit -m "chore: NSE EOD seed data $(date +'%Y-%m-%d')"
+          # Only commit if there are actual changes
+          git diff --cached --quiet || git commit -m "chore: NSE EOD data $(date +'%Y-%m-%d' --date='TZ=Asia/Kolkata')"
           git push
