@@ -24,19 +24,28 @@
             <artifactId>httpclient5</artifactId>
             <version>5.3.1</version>
         </dependency>
+
         <!-- CSV parsing -->
         <dependency>
             <groupId>com.opencsv</groupId>
             <artifactId>opencsv</artifactId>
             <version>5.9</version>
         </dependency>
-        <!-- Logging -->
+
+        <!-- Logging: slf4j-api + logback-classic (fixes StaticLoggerBinder warning) -->
         <dependency>
             <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-simple</artifactId>
+            <artifactId>slf4j-api</artifactId>
             <version>2.0.13</version>
         </dependency>
-        <!-- Jackson for JSON (NSE sometimes returns JSON) -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>1.5.6</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Jackson for JSON (NSE occasionally returns JSON error bodies) -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
@@ -59,9 +68,25 @@
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.nse.feed.Main</mainClass>
                                 </transformer>
+                                <!-- Merge META-INF/services (required for logback auto-discovery) -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <!-- Merge logback configuration files if multiple on classpath -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.AppendingTransformer">
+                                    <resource>META-INF/spring.handlers</resource>
+                                </transformer>
                             </transformers>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <filters>
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <!-- Remove signature files that cause SecurityException in fat-jar -->
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
                         </configuration>
                     </execution>
                 </executions>

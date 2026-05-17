@@ -17,102 +17,118 @@ import java.util.Map;
 /**
  * Entry point for the NSE → TradingView seed ETL.
  *
- * ─── Run Modes ───────────────────────────────────────────────────────────────
+ * ─── Run Modes ────────────────────────────────────────────────────────────────
  *
- *  COLD-START (full extract)  — triggered when ANY of these is true:
- *    a) data/cold_start.done sentinel file does not exist
- *       (first ever run on a fresh checkout / fresh Actions runner)
- *    b) today is MONDAY  (weekly re-baseline to prevent drift)
- *    c) --force-full flag is passed as CLI argument
+ *  COLD-START (full extract) — triggered when ANY of:
+ *    a) data/cold_start.done sentinel missing   (first-ever run)
+ *    b) today is MONDAY                         (weekly re-baseline)
+ *    c) --force-full CLI flag
  *
- *    Action:
- *      ① Download full circuit_DDMMYYYY.csv (~2000 rows, ALL EQ symbols)
- *      ② Parse & full-merge with ASM list
- *      ③ Write seed rows for every symbol
- *      ④ Write / touch data/cold_start.done sentinel
+ *  DELTA (incremental) — every other trading day (Tue–Fri).
  *
- *  DELTA (normal daily run)   — every other trading day:
- *      ① Download eq_band_changes_DDMMYYYY.csv (~10-50 rows, ONLY changed symbols)
- *      ② Parse & delta-merge with ASM list
- *      ③ Write seed rows ONLY for changed symbols (unchanged files untouched)
+ *  NON-TRADING DAY GUARD:
+ *    If NSE returns no data (404 / empty) for the given date the ETL logs
+ *    a clear message and exits with code 0 (success). This prevents GitHub
+ *    Actions from marking Sunday / public holiday runs as failures.
  *
- *  ASM list is ALWAYS downloaded fresh (full list, small ~100-300 rows).
- *
- * ─── CLI arguments (optional) ────────────────────────────────────────────────
- *   --force-full     force a cold-start full extract regardless of sentinel
- *   --date YYYY-MM-DD  override trade date (default: today)
- *
- * ─── Sentinel file ───────────────────────────────────────────────────────────
- *   data/cold_start.done  — plain text file containing the date of last full run.
- *   Created/updated by this job after every successful cold-start run.
- *   Committed to the repo by GitHub Actions so the next daily run knows
- *   a baseline already exists.
+ * ─── CLI args ─────────────────────────────────────────────────────────────────
+ *   --force-full            force cold-start regardless of sentinel
+ *   --date YYYY-MM-DD       override trade date (default: today)
  */
 public class Main {
 
     private static final Logger log = LoggerFactory.getLogger(Main.class);
-    private static final String DATA_DIR       = "data";
-    private static final String SENTINEL_FILE  = DATA_DIR + "/cold_start.done";
+    private static final String DATA_DIR      = "data";
+    private static final String SENTINEL_FILE = DATA_DIR + "/cold_start.done";
 
     public static void main(String[] args) throws Exception {
         log.info("======================================================");
         log.info(" NSE TradingView Feed ETL — started");
         log.info("======================================================");
 
-        // ── Parse CLI args ──────────────────────────────────────────────────
-        List<String> argList   = Arrays.asList(args);
-        boolean forceFull      = argList.contains("--force-full");
-        LocalDate tradeDate    = parseDate(argList);
-        log.info("Trade date   : {}", tradeDate);
-        log.info("Force-full   : {}", forceFull);
+        // ── Parse CLI args ────────────────────────────────────────────────────
+        List<String> argList = Arrays.asList(args);
+        boolean forceFull    = argList.contains("--force-full");
+        LocalDate tradeDate  = parseDate(argList);
 
-        // ── Determine run mode ──────────────────────────────────────────────
+        log.info("Trade date : {}", tradeDate);
+        log.info("Day of week: {}", tradeDate.getDayOfWeek());
+        log.info("Force-full : {}", forceFull);
+
+        // ── Weekend / non-trading day fast-exit ───────────────────────────────
+        // Skip Sundays proactively to avoid unnecessary NSE warm-up calls.
+        // Saturday is kept because NSE occasionally publishes Saturday data.
+        if (tradeDate.getDayOfWeek() == DayOfWeek.SUNDAY && !forceFull) {
+            log.info("Today is Sunday — NSE markets closed. Nothing to do. Exiting cleanly.");
+            return;
+        }
+
+        // ── Determine run mode ────────────────────────────────────────────────
         boolean coldStart = forceFull
                 || !sentinelExists()
                 || tradeDate.getDayOfWeek() == DayOfWeek.MONDAY;
 
-        log.info("Run mode     : {}", coldStart ? "COLD-START (full extract)" : "DELTA (incremental)");
-        if (!coldStart && tradeDate.getDayOfWeek() == DayOfWeek.MONDAY) {
-            log.info("  → Monday detected: forcing full extract for weekly re-baseline.");
-        }
-        if (!sentinelExists() && !forceFull) {
-            log.info("  → Sentinel data/cold_start.done not found: first-ever run, doing full extract.");
-        }
+        log.info("Run mode   : {}",
+                coldStart ? "COLD-START (full extract)" : "DELTA (incremental)");
 
-        // ── Shared HTTP client + NSE session warm-up ────────────────────────
+        // ── Shared HTTP client + NSE session ──────────────────────────────────
         try (NseClient client = new NseClient()) {
             client.warmUpSession();
 
-            // ── ASM: always a full refresh (list is small) ──────────────────
+            // ── ASM: always full refresh (small file, ~100-300 rows) ──────────
             AsmDownloader asmDownloader = new AsmDownloader(client);
             Map<String, AsmRecord> asmMap = asmDownloader.download(tradeDate);
-            log.info("ASM records  : {}", asmMap.size());
 
-            DataMerger  merger = new DataMerger();
+            // ── Non-trading day guard: ASM 404 means no market data today ─────
+            // If ASM returned empty AND we did not force a run, it's a holiday.
+            if (asmMap.isEmpty() && !forceFull) {
+                log.info("ASM list empty for {} — likely a public holiday or non-trading day.", tradeDate);
+                log.info("Attempting price band download to confirm before skipping...");
+
+                // Double-check: try downloading the price band file too.
+                // If both are 404, we're certain it's a non-trading day.
+                byte[] bandCheck = client.downloadFullBandCsv(tradeDate);
+                if (bandCheck == null) {
+                    log.info("Price band also unavailable for {}. Confirmed non-trading day.", tradeDate);
+                    log.info("======================================================");
+                    log.info(" ETL skipped — non-trading day. Exit code 0.");
+                    log.info("======================================================");
+                    return; // Clean exit — GitHub Actions will show green ✓
+                }
+                log.info("Price band available — proceeding with empty ASM map.");
+            }
+
+            log.info("ASM records: {}", asmMap.size());
+
+            DataMerger merger = new DataMerger();
             SeedWriter  writer = new SeedWriter(DATA_DIR);
 
             if (coldStart) {
-                // ── COLD-START: full price band extract ─────────────────────
+                // ── COLD-START: download full circuit file ────────────────────
                 PriceBandDownloader pbDownloader = new PriceBandDownloader(client);
                 List<PriceBandRecord> priceBands = pbDownloader.downloadFull(tradeDate);
-                log.info("Price band records (full): {}", priceBands.size());
 
+                if (priceBands.isEmpty()) {
+                    log.warn("[Cold-Start] Price band file empty for {}. Non-trading day?", tradeDate);
+                    log.info("ETL skipped — no data. Exit code 0.");
+                    return;
+                }
+
+                log.info("Price band records (full): {}", priceBands.size());
                 List<MergedRecord> merged = merger.mergeFull(priceBands, asmMap);
                 writer.write(merged);
-
-                // Write sentinel so next run knows baseline is in place
                 writeSentinel(tradeDate);
                 log.info("Sentinel written: {}", SENTINEL_FILE);
 
             } else {
-                // ── DELTA: only changed symbols ─────────────────────────────
+                // ── DELTA: only changed symbols ───────────────────────────────
                 DeltaBandUpdater deltaUpdater = new DeltaBandUpdater(client);
                 Map<String, PriceBandRecord> deltaMap =
                         deltaUpdater.downloadAndParse(tradeDate);
                 log.info("Band changes today: {}", deltaMap.size());
 
                 if (deltaMap.isEmpty() && asmMap.isEmpty()) {
-                    log.info("No changes today — seed files already up to date.");
+                    log.info("No changes and no ASM data — nothing to write.");
                 } else {
                     List<MergedRecord> merged = merger.mergeDelta(deltaMap, asmMap);
                     writer.write(merged);
@@ -125,7 +141,7 @@ public class Main {
         log.info("======================================================");
     }
 
-    // ── Sentinel helpers ────────────────────────────────────────────────────
+    // ── Sentinel helpers ──────────────────────────────────────────────────────
 
     private static boolean sentinelExists() {
         return Files.exists(Paths.get(SENTINEL_FILE));
@@ -140,15 +156,14 @@ public class Main {
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
-    // ── CLI helpers ─────────────────────────────────────────────────────────
+    // ── CLI helpers ───────────────────────────────────────────────────────────
 
     private static LocalDate parseDate(List<String> args) {
         int idx = args.indexOf("--date");
         if (idx >= 0 && idx + 1 < args.size()) {
-            try {
-                return LocalDate.parse(args.get(idx + 1));
-            } catch (Exception e) {
-                log.warn("Invalid --date value '{}', using today.", args.get(idx + 1));
+            try { return LocalDate.parse(args.get(idx + 1)); }
+            catch (Exception e) {
+                log.warn("Invalid --date '{}', using today.", args.get(idx + 1));
             }
         }
         return LocalDate.now();

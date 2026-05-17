@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logback configuration for nse-tradingview-feed.
+  Outputs clean timestamped logs to console (captured by GitHub Actions).
+-->
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} [%-5level] %logger{30} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Quiet noisy third-party loggers -->
+    <logger name="org.apache.hc"          level="WARN"/>
+    <logger name="com.opencsv"            level="WARN"/>
+    <logger name="com.fasterxml.jackson"  level="WARN"/>
+
+    <!-- Our code at INFO -->
+    <logger name="com.nse.feed" level="INFO"/>
+
+    <root level="WARN">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>
