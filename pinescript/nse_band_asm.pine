@@ -1,0 +1,106 @@
+//@version=6
+indicator("NSE Band + ASM Flag", overlay = true, max_labels_count = 500)
+
+// ═══════════════════════════════════════════════════════════════
+// NSE Price Band + ASM Surveillance Indicator
+// Uses request.seed() to read daily data from:
+//   github.com/rhariram11/nse-tradingview-feed
+//
+// Seed field mapping:
+//   close  = circuit band %  (5/10/20; 0 = no static band / F&O)
+//   high   = upper circuit level
+//   low    = lower circuit level
+//   open   = prev close
+//   volume = ASM stage code
+//             0  = No surveillance
+//             11 = STASM Stage I
+//             12 = STASM Stage II
+//             13 = LTASM Stage I
+//             14 = LTASM Stage II
+//             15 = LTASM Stage III
+//             20 = GSM
+// ═══════════════════════════════════════════════════════════════
+
+// ── Inputs ──────────────────────────────────────────────────────
+showCircuits  = input.bool(true,  "Show circuit level lines")
+showBandLabel = input.bool(true,  "Show band % label")
+showAsmBg     = input.bool(true,  "Highlight ASM/LTASM background")
+showAsmLabel  = input.bool(true,  "Show ASM stage label")
+
+// ── Pull seed data ───────────────────────────────────────────────
+// TradingView request.seed reads from your GitHub repo.
+// syminfo.ticker returns the exchange ticker of the current chart.
+[prevCl, upper, lower, bandPct, asmCodeF] =
+    request.seed(
+        "rhariram11/nse-tradingview-feed",
+        syminfo.ticker,
+        [open, high, low, close, volume]
+    )
+
+asmCode = int(asmCodeF)
+
+// ── Helper: ASM label text ────────────────────────────────────────
+asmLabel(code) =>
+    switch code
+        11 => "STASM-I"
+        12 => "STASM-II"
+        13 => "LTASM-I"
+        14 => "LTASM-II"
+        15 => "LTASM-III"
+        20 => "GSM"
+        => ""
+
+asmColor(code) =>
+    code >= 13 ? color.new(color.red,    70) :
+    code >= 11 ? color.new(color.orange, 70) :
+    code == 20 ? color.new(color.purple, 70) :
+                 color.new(color.blue,   100)  // transparent
+
+bandColor(pct) =>
+    pct == 2  ? color.new(color.gray,   0) :
+    pct == 5  ? color.new(color.yellow, 0) :
+    pct == 10 ? color.new(color.orange, 0) :
+    pct == 20 ? color.new(color.green,  0) :
+                color.new(color.teal,   0)  // F&O / no static band
+
+// ── Plots ────────────────────────────────────────────────────────
+// Circuit lines (horizontal reference)
+plot(showCircuits and upper > 0 ? upper : na,
+     title = "Upper Circuit", color = color.red,   linewidth = 2,
+     style = plot.style_circles)
+plot(showCircuits and lower > 0 ? lower : na,
+     title = "Lower Circuit", color = color.green, linewidth = 2,
+     style = plot.style_circles)
+
+// ASM background shading
+bgcolor(showAsmBg ? asmColor(asmCode) : na, title = "ASM Background")
+
+// ── Labels on last bar ────────────────────────────────────────────
+if barstate.islast
+    // Band label
+    if showBandLabel
+        bandText = bandPct == 0
+                   ? "No static circuit (F\u0026O)"
+                   : str.format("Circuit: {0}%\nU={1,number,#.##}  L={2,number,#.##}",
+                                bandPct, upper, lower)
+        label.new(bar_index, upper > 0 ? upper : high,
+                  text  = bandText,
+                  color = bandColor(bandPct),
+                  style = label.style_label_down,
+                  textcolor = color.white,
+                  size  = size.small)
+
+    // ASM label
+    if showAsmLabel and asmCode > 0
+        label.new(bar_index, low,
+                  text  = "⚠ " + asmLabel(asmCode),
+                  color = asmCode >= 13 ? color.red : color.orange,
+                  style = label.style_label_up,
+                  textcolor = color.white,
+                  size  = size.normal)
+
+// ── Data window values ────────────────────────────────────────────
+plot(bandPct,  title = "Band %",        display = display.data_window)
+plot(asmCodeF, title = "ASM Code",      display = display.data_window)
+plot(upper,    title = "Upper Circuit", display = display.data_window)
+plot(lower,    title = "Lower Circuit", display = display.data_window)

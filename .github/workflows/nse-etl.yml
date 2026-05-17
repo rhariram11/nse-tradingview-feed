@@ -1,0 +1,47 @@
+name: NSE EOD Feed ETL
+
+# Runs Monday–Saturday at 4:30 PM IST (11:00 UTC) — 1 hour after NSE market close
+# NSE publishes ASM and price band files shortly after 3:30 PM IST EOD
+on:
+  schedule:
+    - cron: '0 11 * * 1-6'
+
+  # Allow manual trigger from GitHub Actions UI for testing
+  workflow_dispatch:
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # Required to commit data/ files back to repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build JAR
+        run: mvn -q clean package -DskipTests
+
+      - name: Run ETL
+        run: java -jar target/nse-feed-1.0.0.jar
+        env:
+          # Reserve for future auth tokens / proxy settings if needed
+          NSE_USER_AGENT: 'Mozilla/5.0 (compatible; NSE-Feed-Bot/1.0)'
+
+      - name: Commit data files
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/
+          # Only commit if there are changes
+          git diff --cached --quiet || git commit -m "chore: NSE EOD seed data $(date +'%Y-%m-%d')"
+          git push
