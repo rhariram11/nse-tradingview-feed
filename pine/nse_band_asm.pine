@@ -25,6 +25,7 @@
 //   0  = not in ASM
 //   11 = STASM Stage I    12 = STASM Stage II    13 = STASM Stage III
 //   21 = LTASM Stage I    22 = LTASM Stage II    23 = LTASM Stage III
+//   24 = LTASM Stage IV
 //   30 = GSM
 // ─────────────────────────────────────────────────────────────────────────────
 indicator("NSE Band & ASM Info", shorttitle = "NSE-BAND-ASM",
@@ -44,7 +45,7 @@ float  i_band_pct   = input.float(0.0,  "Band % (numeric)",
                         tooltip = "e.g. 20 for a 20% circuit",
                         group   = G_DATA)
 string i_asm_label  = input.string("",   "ASM Label",
-                        tooltip = "e.g. STASM-I  /  LTASM-II  /  GSM",
+                        tooltip = "e.g. STASM-I  /  LTASM-II  /  LTASM-IV  /  GSM",
                         group   = G_DATA)
 string i_asm_type   = input.string("",   "ASM Type",
                         tooltip = "STASM / LTASM / GSM — raw type field",
@@ -53,7 +54,7 @@ string i_asm_stage  = input.string("",   "ASM Stage",
                         tooltip = "I / II / III / IV",
                         group   = G_DATA)
 int    i_asm_code   = input.int(0,       "ASM Code",
-                        tooltip = "0=none  11=STASM-I  12=STASM-II  21=LTASM-I  22=LTASM-II  30=GSM",
+                        tooltip = "0=none  11=STASM-I  12=STASM-II  13=STASM-III  21=LTASM-I  22=LTASM-II  23=LTASM-III  24=LTASM-IV  30=GSM",
                         group   = G_DATA)
 
 // ── Display toggles ───────────────────────────────────────────────────────────
@@ -71,7 +72,7 @@ color i_ok_col   = input.color(color.new(color.teal,   0), "Normal colour", grou
 string sym      = syminfo.ticker
 bool   in_asm   = i_asm_code > 0 or i_asm_label != ""
 bool   in_stasm = i_asm_code >= 11 and i_asm_code <= 13
-bool   in_ltasm = i_asm_code >= 21 and i_asm_code <= 23
+bool   in_ltasm = i_asm_code >= 21 and i_asm_code <= 29  // covers Stage I–IV (codes 21–24) and future stages up to 29
 bool   in_gsm   = i_asm_code == 30
 
 // Display strings
@@ -180,7 +181,7 @@ if barstate.islast and i_show_table
 //   "Band PCT == 20"  → 20% circuit stocks only
 //   "ASM Code > 0"    → any ASM stock
 //   "ASM Code >= 11 and ASM Code <= 13" → STASM only
-//   "ASM Code >= 21 and ASM Code <= 23" → LTASM only
+//   "ASM Code >= 21 and ASM Code <= 29" → LTASM only (all stages)
 //   "ASM Code == 30"  → GSM only
 plot(i_band_pct,  title = "Band PCT",  display = display.none, editable = false)
 plot(i_asm_code,  title = "ASM Code",  display = display.none, editable = false)
