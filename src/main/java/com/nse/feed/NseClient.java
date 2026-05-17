@@ -19,7 +19,7 @@ import java.time.format.DateTimeFormatter;
 /**
  * Handles all HTTP communication with NSE India.
  *
- * ── URL Strategy (verified 2026-05-17) ────────────────────────────────────────
+ * ── URL Strategy (verified 2026-05-17) ───────────────────────────────────────
  *
  * FULL price band master (all EQ symbols):
  *   https://nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv
@@ -30,7 +30,7 @@ import java.time.format.DateTimeFormatter;
  * DELTA band changes (changed symbols only):
  *   https://nsearchives.nseindia.com/content/equities/eq_band_changes_{ddmmyyyy}.csv
  *   - IMPORTANT: filename carries NEXT trading day's date
- *     e.g. changes effective Monday are in file eq_band_changes_19052026.csv
+ *     e.g. changes effective Monday are in eq_band_changes_19052026.csv
  *          published after Friday market close (16-May-2026 run)
  *   - No session/cookie needed
  *   - ~5-50 rows: SYMBOL, SERIES, PRICE_BAND_NEW, PRICE_BAND_OLD, EFFECTIVE_DATE, REMARKS
@@ -41,7 +41,7 @@ import java.time.format.DateTimeFormatter;
  *   - Requires session warm-up (homepage GET → cookie capture → API call)
  *   - Fallback: derive from REMARKS column in eq_band_changes (contains "ASM Stage N")
  *
- * ── What NOT to use ────────────────────────────────────────────────────────────
+ * ── What NOT to use ──────────────────────────────────────────────────────────
  *   https://www.nseindia.com/api/reports?archives=...  ← requires live browser session
  *   Returns 404 for all files from headless Java HTTP clients.
  */
@@ -98,7 +98,6 @@ public class NseClient implements AutoCloseable {
     /**
      * Warms up the NSE session by fetching the homepage and a secondary page.
      * This seeds the nsit + nseappid cookies required by /api/* endpoints.
-     *
      * NOT needed for nsearchives.nseindia.com downloads.
      */
     public void warmUpSession() throws IOException {
@@ -122,9 +121,7 @@ public class NseClient implements AutoCloseable {
 
     /**
      * Downloads sec_list_{ddmmyyyy}.csv — full price band master for all EQ symbols.
-     *
-     * Tries up to 7 calendar days backwards from {@code forDate} to find the
-     * latest available trading day file (handles bank holidays gracefully).
+     * Tries up to 7 calendar days backwards from forDate (handles bank holidays).
      *
      * @return CSV text, or null if no file found in 7-day window
      */
@@ -147,22 +144,20 @@ public class NseClient implements AutoCloseable {
 
     /**
      * Downloads eq_band_changes_{ddmmyyyy}.csv — delta band changes.
-     *
-     * IMPORTANT: NSE names this file with the NEXT trading day's date.
-     * Strategy: try nextTradingDay(runDate) first, then runDate, then prevTradingDay.
-     * This handles runs at different times (pre-publish, post-publish, next-morning).
+     * NSE names this file with the NEXT trading day's date.
+     * Tries: nextTradingDay(runDate) → runDate → prevTradingDay(runDate).
      *
      * @return CSV text, or null if no delta file published yet for this cycle
      */
     public String downloadBandChanges(LocalDate runDate) throws IOException {
         LocalDate[] candidates = {
-            nextTradingDay(runDate),  // primary: file named with next trading day
-            runDate,                  // fallback 1: sometimes same-day naming
-            prevTradingDay(runDate)   // fallback 2: already-published from yesterday run
+            nextTradingDay(runDate),
+            runDate,
+            prevTradingDay(runDate)
         };
-
         for (LocalDate candidate : candidates) {
-            String url = ARCHIVE_BASE + "eq_band_changes_" + candidate.format(FILE_DATE_FMT) + ".csv";
+            String url = ARCHIVE_BASE + "eq_band_changes_"
+                    + candidate.format(FILE_DATE_FMT) + ".csv";
             log.info("[NSE] Trying eq_band_changes: {}", url);
             String body = getArchiveText(url);
             if (body != null) {
@@ -178,12 +173,10 @@ public class NseClient implements AutoCloseable {
     /**
      * Downloads ASM securities via session-gated API.
      * Calls warmUpSession() automatically if not already done.
-     *
-     * Returns combined shortterm + longterm JSON string, or null on failure.
-     * On HTTP error the caller should fall back to deriving ASM from band-change REMARKS.
+     * Returns combined shortterm+longterm JSON, or null on failure.
      */
     public String downloadAsmJson() throws IOException {
-        warmUpSession(); // idempotent
+        warmUpSession();
         sleep(500);
 
         String shortTerm = getWithSession(ASM_SHORTTERM, "reports/asm");
@@ -193,35 +186,39 @@ public class NseClient implements AutoCloseable {
             log.warn("[NSE] ASM session API returned null for both endpoints.");
             return null;
         }
-        // Return whichever succeeded — AsmDownloader merges both
         if (shortTerm != null && longTerm != null) {
-            // Combine: strip trailing ] from shortTerm, strip leading [ from longTerm
-            String st = shortTerm.trim();
-            String lt = longTerm.trim();
-            // Both may be wrapped in {"data":[...]} — caller handles parsing
-            return "{\"shortterm\":" + st + ",\"longterm\":" + lt + "}";
+            return "{\"shortterm\":" + shortTerm.trim()
+                 + ",\"longterm\":"
+                 + longTerm.trim() + "}";
         }
         return shortTerm != null ? shortTerm : longTerm;
     }
 
     // ── Core HTTP helpers ─────────────────────────────────────────────────────
+    //
+    // ParseException (thrown by EntityUtils.toString) is caught here and
+    // re-thrown as IOException so no caller needs to handle it separately.
+    // This keeps the entire public API throwing only IOException.
 
     /**
      * GET from nsearchives (no session needed).
      * Returns response body as UTF-8 String, or null on 404/403.
      * Throws IOException on other non-200 statuses.
      */
-    public String getArchiveText(String url) throws IOException, ParseException {
+    public String getArchiveText(String url) throws IOException {
         try (CloseableHttpResponse resp = http.execute(buildGet(url, null))) {
             int status = resp.getCode();
             if (status == 200) {
-                String body = EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8);
-                // Guard against empty or HTML error page
-                if (body == null || body.isBlank() || body.stripLeading().startsWith("<")) {
-                    log.debug("[NSE] 200 but empty/HTML body for: {}", url);
-                    return null;
+                try {
+                    String body = EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8);
+                    if (body == null || body.isBlank() || body.stripLeading().startsWith("<")) {
+                        log.debug("[NSE] 200 but empty/HTML body for: {}", url);
+                        return null;
+                    }
+                    return body;
+                } catch (ParseException e) {
+                    throw new IOException("Failed to parse HTTP body from: " + url, e);
                 }
-                return body;
             }
             if (status == 404 || status == 403) {
                 log.debug("[NSE] HTTP {} (not available): {}", status, url);
@@ -237,7 +234,7 @@ public class NseClient implements AutoCloseable {
      * GET with session cookies (for nseindia.com /api/* endpoints).
      * Returns response body, or null on 404/403/401.
      */
-    public String getWithSession(String url, String refererPath) throws IOException, ParseException {
+    public String getWithSession(String url, String refererPath) throws IOException {
         HttpGet req = buildGet(url, refererPath);
         req.setHeader("Accept", "application/json, text/plain, */*");
         req.setHeader("X-Requested-With", "XMLHttpRequest");
@@ -245,7 +242,11 @@ public class NseClient implements AutoCloseable {
             int status = resp.getCode();
             log.info("[NSE] {} → HTTP {}", url, status);
             if (status == 200) {
-                return EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8);
+                try {
+                    return EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8);
+                } catch (ParseException e) {
+                    throw new IOException("Failed to parse HTTP body from: " + url, e);
+                }
             }
             EntityUtils.consume(resp.getEntity());
             log.warn("[NSE] Session API HTTP {} for: {}", status, url);
@@ -253,7 +254,7 @@ public class NseClient implements AutoCloseable {
         }
     }
 
-    // ── Date utilities (static, reusable across the package) ─────────────────
+    // ── Date utilities ────────────────────────────────────────────────────────
 
     public static boolean isWeekend(LocalDate d) {
         return d.getDayOfWeek() == DayOfWeek.SATURDAY
